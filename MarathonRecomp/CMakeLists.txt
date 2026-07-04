@@ -1,5 +1,9 @@
 project("MarathonRecomp")
 
+if (MARATHON_RECOMP_SWITCH)
+    option(MARATHON_RECOMP_SWITCH_USE_PREGENERATED_APP_SHADERS "Use pre-generated SPIR-V headers for built-in app shaders." OFF)
+endif()
+
 if (WIN32)
     option(MARATHON_RECOMP_D3D12 "Add D3D12 support for rendering" ON)
 endif()
@@ -31,9 +35,15 @@ function(BIN2C)
         set(BIN2C_ARGS_COMPRESSION_TYPE "none")
     endif()
 
+    if (MARATHON_RECOMP_SWITCH)
+        set(BIN2C_COMMAND "${MARATHON_RECOMP_HOST_FILE_TO_C}")
+    else()
+        set(BIN2C_COMMAND "$<TARGET_FILE:file_to_c>")
+    endif()
+
     add_custom_command(OUTPUT "${BIN2C_ARGS_DEST_FILE}.c"
-        COMMAND $<TARGET_FILE:file_to_c> "${BIN2C_ARGS_SOURCE_FILE}" "${BIN2C_ARGS_ARRAY_NAME}" "${BIN2C_ARGS_COMPRESSION_TYPE}" "${BIN2C_ARGS_DEST_FILE}.c" "${BIN2C_ARGS_DEST_FILE}.h"
-        DEPENDS "${BIN2C_ARGS_SOURCE_FILE}"
+        COMMAND ${BIN2C_COMMAND} "${BIN2C_ARGS_SOURCE_FILE}" "${BIN2C_ARGS_ARRAY_NAME}" "${BIN2C_ARGS_COMPRESSION_TYPE}" "${BIN2C_ARGS_DEST_FILE}.c" "${BIN2C_ARGS_DEST_FILE}.h"
+        DEPENDS "${BIN2C_ARGS_SOURCE_FILE}" ${BIN2C_COMMAND}
         BYPRODUCTS "${BIN2C_ARGS_DEST_FILE}.h"
         COMMENT "Generating binary header for ${BIN2C_ARGS_SOURCE_FILE}..."
     )
@@ -58,8 +68,10 @@ add_compile_options(
 
 if (WIN32)
     add_compile_options(/fp:strict)
-else()
-    add_compile_options(-ffp-model=strict)
+elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffp-model=strict>)
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-frounding-math>)
 endif()
 
 add_compile_definitions(
@@ -86,7 +98,28 @@ set(MARATHON_RECOMP_LOCALE_CXX_SOURCES
     "locale/locale.cpp"
 )
 
-if (WIN32)
+if (MARATHON_RECOMP_SWITCH)
+    set(MARATHON_RECOMP_OS_CXX_SOURCES
+        "os/switch/logger_switch.cpp"
+        "os/switch/media_switch.cpp"
+        "os/switch/process_switch.cpp"
+        "os/switch/runtime_switch.cpp"
+        "os/switch/user_switch.cpp"
+        "os/switch/version_switch.cpp"
+        # Satisfies SDL2's egl* references without linking the old-Mesa
+        # libEGL portlib, whose bundled ralloc clashes with the NVK driver.
+        "os/switch/egl_stub.cpp"
+        # Lazy commit-on-fault: restores PC's zero-page semantics for stray and
+        # aliased guest reads that the sparse commit does not cover.
+        "os/switch/exception_switch.cpp"
+    )
+    # Only compile the weak ICD fallback when the real NVK driver is absent: a
+    # weak definition in an object satisfies the ICD symbol and would stop the
+    # linker pulling the strong one from libvulkan.a.
+    if (NOT PLUME_SWITCH_NVK_LIBRARY OR NOT EXISTS "${PLUME_SWITCH_NVK_LIBRARY}")
+        list(APPEND MARATHON_RECOMP_OS_CXX_SOURCES "os/switch/nvk_icd_stub.cpp")
+    endif()
+elseif (WIN32)
     set(MARATHON_RECOMP_OS_CXX_SOURCES
         "os/win32/logger_win32.cpp"
         "os/win32/media_win32.cpp"
@@ -132,8 +165,16 @@ set(MARATHON_RECOMP_APU_CXX_SOURCES
 
 set(MARATHON_RECOMP_HID_CXX_SOURCES
     "hid/hid.cpp"
-    "hid/driver/sdl_hid.cpp"
 )
+if (MARATHON_RECOMP_SWITCH)
+    list(APPEND MARATHON_RECOMP_HID_CXX_SOURCES
+        "hid/driver/switch_hid.cpp"
+    )
+else()
+    list(APPEND MARATHON_RECOMP_HID_CXX_SOURCES
+        "hid/driver/sdl_hid.cpp"
+    )
+endif()
 
 set(MARATHON_RECOMP_PATCHES_CXX_SOURCES
     "patches/aspect_ratio_patches.cpp"
@@ -364,7 +405,42 @@ if (MARATHON_RECOMP_FLATPAK)
     )
 endif()
 
+if (MARATHON_RECOMP_SWITCH)
+    set(MARATHON_RECOMP_HOST_TOOLS_DIR "${CMAKE_SOURCE_DIR}/build/host-tools" CACHE PATH "Directory containing host-side generation tools.")
+    set(MARATHON_RECOMP_HOST_FILE_TO_C "${MARATHON_RECOMP_HOST_TOOLS_DIR}/tools/file_to_c/file_to_c${CMAKE_HOST_EXECUTABLE_SUFFIX}" CACHE FILEPATH "Host file_to_c executable.")
+    set(MARATHON_RECOMP_HOST_U8EXTRACT "${MARATHON_RECOMP_HOST_TOOLS_DIR}/tools/u8extract/u8extract${CMAKE_HOST_EXECUTABLE_SUFFIX}" CACHE FILEPATH "Host u8extract executable.")
+    set(MARATHON_RECOMP_HOST_XENON_RECOMP "${MARATHON_RECOMP_HOST_TOOLS_DIR}/tools/XenonRecomp/XenonRecomp/XenonRecomp${CMAKE_HOST_EXECUTABLE_SUFFIX}" CACHE FILEPATH "Host XenonRecomp executable.")
+    set(MARATHON_RECOMP_HOST_XENOS_RECOMP "${MARATHON_RECOMP_HOST_TOOLS_DIR}/tools/XenosRecomp/XenosRecomp/XenosRecomp${CMAKE_HOST_EXECUTABLE_SUFFIX}" CACHE FILEPATH "Host XenosRecomp executable.")
+
+    target_compile_definitions(MarathonRecomp PRIVATE
+        "MARATHON_RECOMP_SWITCH"
+        "__SWITCH__"
+        "NX"
+        "VK_USE_PLATFORM_VI_NN"
+        "IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS"
+        "GAME_INSTALL_DIRECTORY=\"sdmc:/switch/MarathonRecomp\""
+    )
+endif()
+
 find_package(CURL REQUIRED)
+
+if (MARATHON_RECOMP_SWITCH)
+    set(MARATHON_RECOMP_HOST_DXC_ROOT "${MARATHON_RECOMP_TOOLS_ROOT}/XenosRecomp/thirdparty/dxc-bin")
+    if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+        # x64 dxc: the arm64 build emits invalid SPIR-V for atomic shaders.
+        set(DIRECTX_DXC_TOOL "${MARATHON_RECOMP_HOST_DXC_ROOT}/bin/x64/dxc.exe")
+    elseif (CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
+        set(DIRECTX_DXC_TOOL
+            "${CMAKE_COMMAND}" "-E" "env" "DYLD_LIBRARY_PATH=${MARATHON_RECOMP_HOST_DXC_ROOT}/lib/x64"
+            "${MARATHON_RECOMP_HOST_DXC_ROOT}/bin/x64/dxc-macos"
+        )
+    else()
+        set(DIRECTX_DXC_TOOL
+            "${CMAKE_COMMAND}" "-E" "env" "LD_LIBRARY_PATH=${MARATHON_RECOMP_HOST_DXC_ROOT}/lib/x64"
+            "${MARATHON_RECOMP_HOST_DXC_ROOT}/bin/x64/dxc-linux"
+        )
+    endif()
+endif()
 
 if (MARATHON_RECOMP_METAL)
     target_compile_definitions(MarathonRecomp PRIVATE MARATHON_RECOMP_METAL)
@@ -421,6 +497,10 @@ target_link_libraries(MarathonRecomp PRIVATE
 
 target_link_libraries(MarathonRecomp PRIVATE ffmpeg)
 
+if (MARATHON_RECOMP_SWITCH)
+    target_link_libraries(MarathonRecomp PRIVATE nx)
+endif()
+
 target_include_directories(MarathonRecomp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     "${CMAKE_CURRENT_SOURCE_DIR}/api"
@@ -463,6 +543,13 @@ function(compile_shader FILE_PATH TARGET_NAME)
             DEPENDS ${HLSL_FILE_PATH}
         )
         target_sources(MarathonRecomp PRIVATE ${HLSL_FILE_PATH}.dxil.h)
+    endif()
+    if (MARATHON_RECOMP_SWITCH AND MARATHON_RECOMP_SWITCH_USE_PREGENERATED_APP_SHADERS)
+        if (NOT EXISTS ${HLSL_FILE_PATH}.spirv.h)
+            message(FATAL_ERROR "Missing pre-generated app shader header: ${HLSL_FILE_PATH}.spirv.h. Run tools/generate-switch-app-shaders.sh before configuring the Switch build.")
+        endif()
+        target_sources(MarathonRecomp PRIVATE ${HLSL_FILE_PATH}.spirv.h)
+        return()
     endif()
     add_custom_command(
         OUTPUT ${HLSL_FILE_PATH}.spirv.h

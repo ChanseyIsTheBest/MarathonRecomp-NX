@@ -10,6 +10,10 @@
 // Almost all decoding code is from Xenia Canary, so leave the copyright here
 
 #include "xma_decoder.h"
+#if defined(__SWITCH__)
+#include <os/logger.h>
+extern "C" void SwitchSetCurrentThreadPriority(int priority);
+#endif
 
 // #define ENABLE_DEBUG_XMA_DECODER
 
@@ -364,6 +368,10 @@ void Consume(XmaPlayback *playback) {
 }
 
 void DecoderThreadFunc(XmaPlayback *playback) {
+#if defined(__SWITCH__)
+    // Audio-critical: preempt spinning guest threads (see runtime_switch.cpp).
+    SwitchSetCurrentThreadPriority(0x2B);
+#endif
     while (playback->isRunning) {
         std::unique_lock<std::mutex> lock(playback->mutex);
 
@@ -425,7 +433,24 @@ uint32_t XMAPlaybackCreate(uint32_t streams, XMAPLAYBACKINIT *init, uint32_t fla
     const auto xmaPlayback = g_userHeap.AllocPhysical<XmaPlayback>(
             init->sampleRate.get(), init->outputBufferSize.get(), init->channelCount,
             init->subframes);
+#if defined(__SWITCH__)
+    // Runtime-created std::thread is unreliable on this toolchain; use pthreads.
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 512 * 1024);
+    const int rc = pthread_create(&xmaPlayback->decoderThread, &attr,
+        [](void* arg) -> void* {
+            DecoderThreadFunc(static_cast<XmaPlayback*>(arg));
+            return nullptr;
+        },
+        xmaPlayback);
+    pthread_attr_destroy(&attr);
+    xmaPlayback->decoderThreadCreated = (rc == 0);
+    if (rc != 0)
+        LOGFN_ERROR("!!! XMA decoder pthread_create failed: 0x{:X}", rc);
+#else
     xmaPlayback->decoderThread = std::thread(DecoderThreadFunc, xmaPlayback);
+#endif
     *outPlayback = g_memory.MapVirtual(xmaPlayback);
 
     return 0;

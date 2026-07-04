@@ -3,17 +3,33 @@
 #include <kernel/heap.h>
 #include <os/logger.h>
 #include <ui/game_window.h>
+
+#if defined(__SWITCH__)
+extern "C" void SwitchSetCurrentThreadPriority(int priority);
+#endif
 #include <user/config.h>
+
+#include <atomic>
+#include <memory>
+
+#if defined(__SWITCH__)
+#include <pthread.h>
+#endif
 
 static PPCFunc* g_clientCallback{};
 static uint32_t g_clientCallbackParam{}; // pointer in guest memory
 static SDL_AudioDeviceID g_audioDevice{};
+static bool g_audioDeviceReady{};
 static bool g_downMixToStereo;
 
 static void CreateAudioDevice()
 {
     if (g_audioDevice != NULL)
+    {
         SDL_CloseAudioDevice(g_audioDevice);
+        g_audioDevice = 0;
+        g_audioDeviceReady = false;
+    }
 
     bool surround = Config::ChannelConfiguration == EChannelConfiguration::Surround;
     int allowedChanges = surround ? SDL_AUDIO_ALLOW_CHANNELS_CHANGE : 0;
@@ -22,18 +38,32 @@ static void CreateAudioDevice()
     desired.freq = XAUDIO_SAMPLES_HZ;
     desired.format = AUDIO_F32SYS;
     desired.channels = surround ? XAUDIO_NUM_CHANNELS : 2;
+#if defined(__SWITCH__)
+    // Give audren device-side headroom; a single 256-sample period is too tight
+    // for the shared cores and underruns below the SDL queue.
+    desired.samples = XAUDIO_NUM_SAMPLES * 4;
+#else
     desired.samples = XAUDIO_NUM_SAMPLES;
+#endif
     g_audioDevice = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, allowedChanges);
 
-    if (obtained.channels != 2 && obtained.channels != XAUDIO_NUM_CHANNELS) // This check may fail only when surround sound is enabled.
+    if (g_audioDevice && obtained.channels != 2 && obtained.channels != XAUDIO_NUM_CHANNELS) // This check may fail only when surround sound is enabled.
     {
         SDL_CloseAudioDevice(g_audioDevice);
+        g_audioDevice = 0;
+        obtained = {};
         g_audioDevice = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, 0);
     }
 
     if (!g_audioDevice)
+    {
         LOGFN_ERROR("Failed to open audio device: {}", SDL_GetError());
+        g_downMixToStereo = true;
+        g_audioDeviceReady = false;
+        return;
+    }
 
+    g_audioDeviceReady = true;
     g_downMixToStereo = (obtained.channels == 2);
 }
 
@@ -42,6 +72,10 @@ void XAudioInitializeSystem()
 #ifdef _WIN32
     // Force wasapi on Windows.
     SDL_setenv("SDL_AUDIODRIVER", "wasapi", true);
+#endif
+
+#if defined(__SWITCH__)
+    XAudioSetGuestCallbacksEnabled(false);
 #endif
 
     SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
@@ -56,29 +90,84 @@ void XAudioInitializeSystem()
     CreateAudioDevice();
 }
 
+#if defined(__SWITCH__)
+static pthread_t g_audioThread{};
+static bool g_audioThreadCreated{};
+#else
 static std::unique_ptr<std::thread> g_audioThread;
-static volatile bool g_audioThreadShouldExit;
+#endif
+static std::atomic<bool> g_audioThreadShouldExit;
+#if defined(__SWITCH__)
+static std::atomic<bool> g_audioGuestCallbacksEnabled;
+#endif
 
+void XAudioSetGuestCallbacksEnabled(bool enabled)
+{
+#if defined(__SWITCH__)
+    g_audioGuestCallbacksEnabled.store(enabled, std::memory_order_release);
+#else
+    (void)enabled;
+#endif
+}
+
+static bool AreGuestCallbacksEnabled()
+{
+#if defined(__SWITCH__)
+    return g_audioGuestCallbacksEnabled.load(std::memory_order_acquire);
+#else
+    return true;
+#endif
+}
+
+#if defined(__SWITCH__)
+static void* AudioThread(void*)
+#else
 static void AudioThread()
+#endif
 {
     using namespace std::chrono_literals;
 
-    GuestThreadContext ctx(0);
+    std::unique_ptr<GuestThreadContext> ctx;
 
     size_t channels = g_downMixToStereo ? 2 : XAUDIO_NUM_CHANNELS;
 
-    while (!g_audioThreadShouldExit)
+#if defined(__SWITCH__)
+    // Audio must preempt the spinning guest worker threads (0x3B) to hold cadence.
+    SwitchSetCurrentThreadPriority(0x2B);
+
+    // Absolute-deadline pacing: advance the deadline by one interval per tick so
+    // the mixer runs at a steady rate. Snapping to the wall-clock grid jitters on
+    // the shared cores and drains the SDL queue into an audible stutter.
+    constexpr auto PUMP_INTERVAL = std::chrono::nanoseconds(1000000000ll * XAUDIO_NUM_SAMPLES / XAUDIO_SAMPLES_HZ);
+    auto pumpDeadline = std::chrono::steady_clock::now();
+#endif
+
+    while (!g_audioThreadShouldExit.load(std::memory_order_acquire))
     {
-        uint32_t queuedAudioSize = SDL_GetQueuedAudioSize(g_audioDevice);
+        uint32_t queuedAudioSize = g_audioDevice ? SDL_GetQueuedAudioSize(g_audioDevice) : 0;
         constexpr size_t MAX_LATENCY = 10;
         const size_t callbackAudioSize = channels * XAUDIO_NUM_SAMPLES * sizeof(float);
 
         if ((queuedAudioSize / callbackAudioSize) <= MAX_LATENCY)
         {
-            ctx.ppcContext.r3.u32 = g_clientCallbackParam;
-            g_clientCallback(ctx.ppcContext, g_memory.base);
+            if (AreGuestCallbacksEnabled() && g_clientCallback != nullptr)
+            {
+                if (ctx == nullptr)
+                    ctx = std::make_unique<GuestThreadContext>(0);
+
+                ctx->ppcContext.r3.u32 = g_clientCallbackParam;
+                g_clientCallback(ctx->ppcContext, g_memory.base);
+            }
         }
 
+#if defined(__SWITCH__)
+        pumpDeadline += PUMP_INTERVAL;
+        auto now = std::chrono::steady_clock::now();
+        if (now >= pumpDeadline)
+            pumpDeadline = now + PUMP_INTERVAL;
+        else
+            std::this_thread::sleep_until(pumpDeadline);
+#else
         auto now = std::chrono::steady_clock::now();
         constexpr auto INTERVAL = 1000000000ns * XAUDIO_NUM_SAMPLES / XAUDIO_SAMPLES_HZ;
         auto next = now + (INTERVAL - now.time_since_epoch() % INTERVAL);
@@ -87,14 +176,53 @@ static void AudioThread()
 
         while (std::chrono::steady_clock::now() < next)
             std::this_thread::yield();
+#endif
     }
+
+#if defined(__SWITCH__)
+    return nullptr;
+#endif
 }
 
 static void CreateAudioThread()
 {
     SDL_PauseAudioDevice(g_audioDevice, 0);
     g_audioThreadShouldExit = false;
+#if defined(__SWITCH__)
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    constexpr auto AUDIO_THREAD_STACK_SIZE = 2 * 1024 * 1024;
+    const auto stackResult = pthread_attr_setstacksize(&attr, AUDIO_THREAD_STACK_SIZE);
+    if (stackResult != 0)
+        LOGFN_ERROR("Switch XAudio pthread_attr_setstacksize failed: 0x{:X}", stackResult);
+
+    const auto createResult = pthread_create(&g_audioThread, &attr, AudioThread, nullptr);
+    pthread_attr_destroy(&attr);
+    if (createResult != 0)
+    {
+        LOGFN_ERROR("Switch XAudio pthread_create failed: 0x{:X}", createResult);
+        return;
+    }
+
+    g_audioThreadCreated = true;
+#else
     g_audioThread = std::make_unique<std::thread>(AudioThread);
+#endif
+}
+
+static void JoinAudioThread()
+{
+    g_audioThreadShouldExit = true;
+#if defined(__SWITCH__)
+    if (g_audioThreadCreated)
+    {
+        pthread_join(g_audioThread, nullptr);
+        g_audioThreadCreated = false;
+    }
+#else
+    if (g_audioThread != nullptr && g_audioThread->joinable())
+        g_audioThread->join();
+#endif
 }
 
 void XAudioRegisterClient(PPCFunc* callback, uint32_t param)
@@ -143,7 +271,8 @@ void XAudioSubmitFrame(void* samples)
             audioFrames[i * 2 + 1] = isnan(samp1) ? 0.0f : samp1;
         }
 
-        SDL_QueueAudio(g_audioDevice, &audioFrames, sizeof(audioFrames));
+        if (g_audioDevice)
+            SDL_QueueAudio(g_audioDevice, &audioFrames, sizeof(audioFrames));
     }
     else
     {
@@ -158,7 +287,8 @@ void XAudioSubmitFrame(void* samples)
             }
         }
 
-        SDL_QueueAudio(g_audioDevice, &audioFrames, sizeof(audioFrames));
+        if (g_audioDevice)
+            SDL_QueueAudio(g_audioDevice, &audioFrames, sizeof(audioFrames));
     }
 }
 
@@ -166,11 +296,7 @@ void XAudioConfigValueChangedCallback(IConfigDef* configDef)
 {
     if (configDef == &Config::ChannelConfiguration)
     {
-        if (g_audioThread->joinable())
-        {
-            g_audioThreadShouldExit = true;
-            g_audioThread->join();
-        }
+        JoinAudioThread();
 
         CreateAudioDevice();
         CreateAudioThread();

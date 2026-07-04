@@ -1,0 +1,130 @@
+diff --git a/XenosRecomp/CMakeLists.txt b/XenosRecomp/CMakeLists.txt
+index b187f59..42de3e6 100644
+--- a/XenosRecomp/CMakeLists.txt
++++ b/XenosRecomp/CMakeLists.txt
+@@ -30,10 +30,19 @@ target_link_libraries(XenosRecomp PRIVATE
+ 
+ target_include_directories(XenosRecomp PRIVATE ${SMOLV_SOURCE_DIR})
+ 
++if (MARATHON_RECOMP_HOST_TOOLS_ONLY)
++    target_compile_definitions(XenosRecomp PRIVATE MARATHON_RECOMP)
++endif()
++
+ target_precompile_headers(XenosRecomp PRIVATE pch.h)
+ 
+ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+     target_compile_options(XenosRecomp PRIVATE -Wno-switch -Wno-unused-variable -Wno-null-arithmetic -fms-extensions)
++elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++    # -fms-extensions enables the anonymous struct-in-union used by the
++    # instruction decoder; the shader recompiler otherwise fails to build
++    # with GCC (e.g. the msys2/cygwin host toolchain).
++    target_compile_options(XenosRecomp PRIVATE -Wno-switch -Wno-unused-variable -fms-extensions)
+ endif()
+ 
+ if (WIN32)
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index bb8a47e..f2689bb 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -1813,22 +1813,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             auto definition = reinterpret_cast<const Int4Definition*>(definitions);
+             for (uint16_t i = 0; i < definition->count; i++)
+             {
++                // Named array instead of an anonymous struct: GCC rejects an
++                // anonymous struct inside a block-scope anonymous union.
+                 union
+                 {
+                     uint32_t value;
+-                    struct
+-                    {
+-                        int8_t x;
+-                        int8_t y;
+-                        int8_t z;
+-                        int8_t w;
+-                    };
++                    int8_t xyzw[4];
+                 };
+ 
+                 value = definition->values[i].get();
+ 
+                 println("\tint4 i{} = int4({}, {}, {}, {});",
+-                    (definition->registerIndex - 8992) / 4 + i, x, y, z, w);
++                    (definition->registerIndex - 8992) / 4 + i, xyzw[0], xyzw[1], xyzw[2], xyzw[3]);
+             }
+             definitions += 2;
+             definitions += definition->count;
+@@ -1934,13 +1930,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     union
+     {
+         ControlFlowInstruction controlFlow[2];
+-        struct
+-        {
+-            uint32_t code0;
+-            uint32_t code1;
+-            uint32_t code2;
+-            uint32_t code3;
+-        };
++        // Named array instead of an anonymous struct: GCC (unlike MSVC/Clang)
++        // rejects an anonymous struct inside a block-scope anonymous union.
++        uint32_t codeW[4];
+     };
+ 
+     auto controlFlowCode = code;
+@@ -1950,10 +1942,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+     while (instrAddress < instrSize)
+     {
+-        code0 = controlFlowCode[0];
+-        code1 = controlFlowCode[1] & 0xFFFF;
+-        code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
+-        code3 = controlFlowCode[2] >> 16;
++        codeW[0] = controlFlowCode[0];
++        codeW[1] = controlFlowCode[1] & 0xFFFF;
++        codeW[2] = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
++        codeW[3] = controlFlowCode[2] >> 16;
+ 
+         for (auto& cfInstr : controlFlow)
+         {
+@@ -2017,10 +2009,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+     while (instrAddress < instrSize)
+     {
+-        code0 = controlFlowCode[0];
+-        code1 = controlFlowCode[1] & 0xFFFF;
+-        code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
+-        code3 = controlFlowCode[2] >> 16;
++        codeW[0] = controlFlowCode[0];
++        codeW[1] = controlFlowCode[1] & 0xFFFF;
++        codeW[2] = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
++        codeW[3] = controlFlowCode[2] >> 16;
+ 
+         for (auto& cfInstr : controlFlow)
+         {
+@@ -2166,17 +2158,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     VertexFetchInstruction vertexFetch;
+                     TextureFetchInstruction textureFetch;
+                     AluInstruction alu;
+-                    struct
+-                    {
+-                        uint32_t code0;
+-                        uint32_t code1;
+-                        uint32_t code2;
+-                    };
++                    uint32_t codeW[3];
+                 };
+             
+-                code0 = instructionCode[0];
+-                code1 = instructionCode[1];
+-                code2 = instructionCode[2];
++                codeW[0] = instructionCode[0];
++                codeW[1] = instructionCode[1];
++                codeW[2] = instructionCode[2];
+             
+                 if ((sequence & 0x1) != 0)
+                 {
+diff --git a/thirdparty/dxc-bin b/thirdparty/dxc-bin
+--- a/thirdparty/dxc-bin
++++ b/thirdparty/dxc-bin
+@@ -1 +1 @@
+-Subproject commit 737ac9f51c3d06f0cd1ee7e14dc065bafd52310d
++Subproject commit 737ac9f51c3d06f0cd1ee7e14dc065bafd52310d-dirty

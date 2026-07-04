@@ -10,6 +10,7 @@
 void XAudioInitializeSystem();
 void XAudioRegisterClient(PPCFunc* callback, uint32_t param);
 void XAudioSubmitFrame(void* samples);
+void XAudioSetGuestCallbacksEnabled(bool enabled);
 void XAudioConfigValueChangedCallback(class IConfigDef* configDef);
 
 uint32_t XAudioRegisterRenderDriverClient(be<uint32_t>* callback, be<uint32_t>* driver);

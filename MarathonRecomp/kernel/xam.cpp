@@ -12,6 +12,14 @@
 #include <user/paths.h>
 #include <SDL.h>
 
+// XXOVERLAPPED has no Error/Length aliases under GCC; write the raw fields.
+static void XamCompleteOverlapped(XXOVERLAPPED* overlapped, uint32_t error, uint32_t length)
+{
+    overlapped->dwCompletionContext = GuestThread::GetCurrentThreadId();
+    overlapped->InternalLow = be<uint32_t>(error).value;
+    overlapped->InternalHigh = be<uint32_t>(length).value;
+}
+
 struct XamListener : KernelObject
 {
     uint32_t id{};
@@ -125,7 +133,8 @@ XCONTENT_DATA XamMakeContent(uint32_t type, const std::string_view& name)
 
 void XamRegisterContent(const XCONTENT_DATA& data, const std::string_view& root)
 {
-    const auto idx = data.dwContentType - 1;
+    const uint32_t contentType = data.dwContentType.get();
+    const auto idx = contentType - 1;
 
     gContentRegistry[idx].emplace(StringHash(data.szFileName), XHOSTCONTENT_DATA{ data }).first->second.szRoot = root;
 }
@@ -248,9 +257,7 @@ uint32_t XamShowMessageBoxUI(uint32_t dwUserIndex, be<uint16_t>* wszTitle, be<ui
 
     if (pOverlapped)
     {
-        pOverlapped->dwCompletionContext = GuestThread::GetCurrentThreadId();
-        pOverlapped->Error = 0;
-        pOverlapped->Length = -1;
+        XamCompleteOverlapped(pOverlapped, 0, UINT32_MAX);
     }
 
     XamNotifyEnqueueEvent(9, 0);
@@ -314,7 +321,7 @@ uint32_t XamContentCreateEx(uint32_t dwUserIndex, const char* szRootName, const 
     uint32_t dwContentFlags, be<uint32_t>* pdwDisposition, be<uint32_t>* pdwLicenseMask,
     uint32_t dwFileCacheSize, uint64_t uliContentSize, PXXOVERLAPPED pOverlapped)
 {
-    const auto& registry = gContentRegistry[pContentData->dwContentType - 1];
+    const auto& registry = gContentRegistry[pContentData->dwContentType.get() - 1];
     const auto exists = registry.contains(StringHash(pContentData->szFileName));
     const auto mode = dwContentFlags & 0xF;
 

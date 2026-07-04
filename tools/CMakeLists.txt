@@ -8,6 +8,12 @@ if (MARATHON_RECOMP_OPTIMIZE_TOOLS)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 endif()
 
+# The MSYS/Cygwin host toolchain has no wide-character fstream overloads,
+# which toml++ tries to use because it detects Cygwin as Windows.
+if (CMAKE_SYSTEM_NAME MATCHES "MSYS|CYGWIN")
+    add_compile_definitions(TOML_ENABLE_WINDOWS_COMPAT=0)
+endif()
+
 add_subdirectory(${MARATHON_RECOMP_TOOLS_ROOT}/bc_diff)
 add_subdirectory(${MARATHON_RECOMP_TOOLS_ROOT}/file_to_c)
 add_subdirectory(${MARATHON_RECOMP_TOOLS_ROOT}/fshasher)

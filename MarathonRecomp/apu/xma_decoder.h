@@ -5,6 +5,9 @@
 #include <kernel/function.h>
 #include <kernel/heap.h>
 #include <condition_variable>
+#if defined(__SWITCH__)
+#include <pthread.h>
+#endif
 
 extern "C" {
     #include <libavcodec/avcodec.h>
@@ -74,7 +77,15 @@ struct XmaPlayback {
     uint32_t loopStartOffset = 0;
     uint32_t loopEndOffset = 0;
 
+#if defined(__SWITCH__)
+    // Runtime-created std::thread misbehaves on this devkitA64 toolchain
+    // (erratic terminate/hangs; static-init std::threads are fine) — use the
+    // proven pthread primitive for the decoder thread.
+    pthread_t decoderThread{};
+    bool decoderThreadCreated = false;
+#else
     std::thread decoderThread;
+#endif
     std::mutex mutex;
     std::condition_variable cv;
     std::atomic<bool> isLocked { false };
@@ -152,8 +163,15 @@ struct XmaPlayback {
             cv.notify_one();
         }
 
+#if defined(__SWITCH__)
+        if (decoderThreadCreated) {
+            pthread_join(decoderThread, nullptr);
+            decoderThreadCreated = false;
+        }
+#else
         if (decoderThread.joinable()) {
             decoderThread.join();
         }
+#endif
     }
 };

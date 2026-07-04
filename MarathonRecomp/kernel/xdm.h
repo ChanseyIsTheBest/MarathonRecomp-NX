@@ -89,14 +89,19 @@ static_assert(sizeof(WIN32_FIND_DATAA) == 320);
 
 struct KernelObject
 {
-    virtual ~KernelObject() 
+    virtual ~KernelObject()
     {
     }
 
-    virtual uint32_t Wait(uint32_t timeout) 
+    virtual uint32_t Wait(uint32_t timeout)
     {
         assert(false && "Wait not implemented for this kernel object.");
         return STATUS_TIMEOUT;
+    }
+
+    virtual bool IsSignaled() const
+    {
+        return false;
     }
 };
 
@@ -130,7 +135,7 @@ inline T* GetInvalidKernelObject()
     return reinterpret_cast<T*>(g_memory.Translate(GUEST_INVALID_HANDLE_VALUE));
 }
 
-extern Mutex g_kernelLock;
+extern RecompMutex g_kernelLock;
 
 template<typename T>
 inline T* QueryKernelObject(XDISPATCHER_HEADER& header)

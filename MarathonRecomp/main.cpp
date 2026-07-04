@@ -66,16 +66,47 @@ void KiSystemStartup()
 {
     if (g_memory.base == nullptr)
     {
+#if defined(__SWITCH__)
+        LOGFN_ERROR("Switch PPC memory init failed: reason='{}', result=0x{:08X}, selectedBase=0x{:016X}, alias=0x{:016X}+0x{:016X}, aslr=0x{:016X}+0x{:016X}, heap=0x{:016X}+0x{:016X}",
+            g_memory.switchInitFailureReason ? g_memory.switchInitFailureReason : "unknown",
+            g_memory.switchInitResult,
+            g_memory.switchSelectedBase,
+            g_memory.switchAliasBase,
+            g_memory.switchAliasSize,
+            g_memory.switchAslrBase,
+            g_memory.switchAslrSize,
+            g_memory.switchHeapBase,
+            g_memory.switchHeapSize);
+        LOGFN_ERROR("Switch PPC memory commit failure: guestOffset=0x{:016X}, hostAddress=0x{:016X}, queriedMemory=0x{:016X}+0x{:016X}, type=0x{:X}, attr=0x{:X}, perm=0x{:X}, pageInfo=0x{:X}",
+            g_memory.switchCommitFailureOffset,
+            g_memory.switchCommitFailureAddress,
+            g_memory.switchCommitFailureMemoryBase,
+            g_memory.switchCommitFailureMemorySize,
+            g_memory.switchCommitFailureMemoryType,
+            g_memory.switchCommitFailureMemoryAttr,
+            g_memory.switchCommitFailureMemoryPerm,
+            g_memory.switchCommitFailurePageInfo);
+#endif
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("System_MemoryAllocationFailed").c_str(), GameWindow::s_pWindow);
         std::_Exit(1);
     }
 
     g_userHeap.Init();
+    if (g_userHeap.heap == nullptr || g_userHeap.physicalHeap == nullptr)
+    {
+        // Heap init failed: don't run guest code that would allocate NULL.
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("System_MemoryAllocationFailed").c_str(), GameWindow::s_pWindow);
+        std::_Exit(1);
+    }
 
     const auto gameContent = XamMakeContent(XCONTENTTYPE_RESERVED, "Game");
     const std::string gamePath = (const char*)(GetGamePath() / "game").u8string().c_str();
 
+#if !defined(__SWITCH__)
+    // sdmc is case-insensitive, so the path cache (a slow recursive walk of the
+    // game folder over newlib) is skipped on Switch.
     BuildPathCache(gamePath);
+#endif
 
     XamRegisterContent(gameContent, gamePath);
 
@@ -165,6 +196,15 @@ int main(int argc, char *argv[])
 {
 #ifdef _WIN32
     timeBeginPeriod(1);
+#endif
+
+#if defined(__SWITCH__)
+    // NVK (Mesa) uses an on-disk Fossilize shader cache; its stdio file layer
+    // faults on the Switch filesystem during pipeline creation
+    // (disk_cache_load_item_foz -> _fseeko_r -> __sseek). It is only a cross-run
+    // optimization, so disable it entirely before the driver initializes.
+    setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
+    setenv("MESA_GLSL_CACHE_DISABLE", "1", 1);
 #endif
 
     os::process::CheckConsole();
@@ -307,6 +347,15 @@ int main(int argc, char *argv[])
 
         if (!InstallerWizard::Run(GetGamePath(), isGameInstalled && forceDLCInstaller))
             std::_Exit(0);
+
+        isGameInstalled = Installer::checkGameInstall(GetGamePath(), modulePath);
+        if (!isGameInstalled)
+        {
+            constexpr auto message = "Installation completed, but installed game files could not be found.";
+            LOGN_ERROR(message);
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), message, GameWindow::s_pWindow);
+            std::_Exit(1);
+        }
     }
 
     // ModLoader::Init();
@@ -323,8 +372,6 @@ int main(int argc, char *argv[])
             std::_Exit(1);
         }
     }
-    LOGN_WARNING("Start Guest Thread");
-    LOGN_WARNING(modulePath.string());
     // Video::StartPipelinePrecompilation();
 
     GuestThread::Start({ entry, 0, 0 });

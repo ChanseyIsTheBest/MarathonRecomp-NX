@@ -1,6 +1,8 @@
 cmake_minimum_required (VERSION 3.20)
 
-if(NOT DEFINED ENV{VCPKG_ROOT})
+option(MARATHON_RECOMP_HOST_TOOLS_ONLY "Only build host-side generation tools." OFF)
+
+if(NOT MARATHON_RECOMP_SWITCH AND NOT MARATHON_RECOMP_HOST_TOOLS_ONLY AND NOT DEFINED ENV{VCPKG_ROOT})
     message(FATAL_ERROR "VCPKG_ROOT is not defined!")
 endif()
 
@@ -8,6 +10,12 @@ set(MARATHON_RECOMP_THIRDPARTY_ROOT ${CMAKE_SOURCE_DIR}/thirdparty)
 set(MARATHON_RECOMP_TOOLS_ROOT ${CMAKE_SOURCE_DIR}/tools)
 set(CMAKE_CXX_STANDARD 20)
 set(BUILD_SHARED_LIBS OFF)
+
+# The bundled zstd defaults to also building a shared library, which collides
+# with the static archive name when targeting platforms without shared
+# library support (e.g. Switch/libnx).
+set(ZSTD_BUILD_SHARED OFF)
+set(ZSTD_BUILD_PROGRAMS OFF)
 
 # Enable Hot Reload for MSVC compilers if supported.
 if (POLICY CMP0141)
@@ -43,6 +51,11 @@ endif()
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     # Normally only defined by Visual Studio, added for consistency
     add_compile_definitions(_DEBUG)
+endif()
+
+if (MARATHON_RECOMP_HOST_TOOLS_ONLY)
+    add_subdirectory(${MARATHON_RECOMP_TOOLS_ROOT})
+    return()
 endif()
 
 add_subdirectory(${MARATHON_RECOMP_THIRDPARTY_ROOT})

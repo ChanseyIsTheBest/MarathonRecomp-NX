@@ -1,6 +1,7 @@
 #include "file_system.h"
 #include <cpu/guest_thread.h>
 #include <cstdio>
+#include <mutex>
 #include <kernel/xam.h>
 #include <kernel/xdm.h>
 #include <kernel/function.h>
@@ -14,6 +15,11 @@ struct FileHandle : KernelObject
 {
     std::fstream stream;
     std::filesystem::path path;
+    // The guest streams assets from a small set of archive handles across several
+    // loader threads at once. std::fstream is not thread-safe, so concurrent
+    // seek+read on one handle corrupts the filebuf's internal pointers and makes
+    // the underlying read write to a wild address. Serialize per handle.
+    std::mutex mutex;
 };
 
 struct FindHandle : KernelObject
@@ -189,6 +195,7 @@ uint32_t XReadFile
 )
 {
     uint32_t result = FALSE;
+    std::lock_guard<std::mutex> lock(hFile->mutex);
     if (lpOverlapped != nullptr)
     {
         std::streamoff streamOffset = lpOverlapped->Offset + (std::streamoff(lpOverlapped->OffsetHigh.get()) << 32U);
@@ -245,6 +252,7 @@ uint32_t XSetFilePointer(FileHandle* hFile, int32_t lDistanceToMove, be<int32_t>
         break;
     }
 
+    std::lock_guard<std::mutex> lock(hFile->mutex);
     hFile->stream.clear();
     hFile->stream.seekg(streamOffset, streamSeekDir);
     if (hFile->stream.bad())
@@ -278,6 +286,7 @@ uint32_t XSetFilePointerEx(FileHandle* hFile, int32_t lDistanceToMove, LARGE_INT
         break;
     }
 
+    std::lock_guard<std::mutex> lock(hFile->mutex);
     hFile->stream.clear();
     hFile->stream.seekg(lDistanceToMove, streamSeekDir);
     if (hFile->stream.bad())
@@ -338,6 +347,7 @@ uint32_t XReadFileEx(FileHandle* hFile, void* lpBuffer, uint32_t nNumberOfBytesT
 {
     uint32_t result = FALSE;
     uint32_t numberOfBytesRead;
+    std::lock_guard<std::mutex> lock(hFile->mutex);
     std::streamoff streamOffset = lpOverlapped->Offset + (std::streamoff(lpOverlapped->OffsetHigh.get()) << 32U);
     hFile->stream.clear();
     hFile->stream.seekg(streamOffset, std::ios::beg);
@@ -375,6 +385,7 @@ uint32_t XWriteFile(FileHandle* hFile, const void* lpBuffer, uint32_t nNumberOfB
 {
     assert(lpOverlapped == nullptr && "Overlapped not implemented.");
 
+    std::lock_guard<std::mutex> lock(hFile->mutex);
     hFile->stream.write((const char *)(lpBuffer), nNumberOfBytesToWrite);
     if (hFile->stream.bad())
         return FALSE;

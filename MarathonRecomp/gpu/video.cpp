@@ -348,6 +348,52 @@ static bool g_triangleStripWorkaround = false;
 static std::unique_ptr<RenderInterface> g_interface;
 static std::unique_ptr<RenderDevice> g_device;
 
+#if defined(__SWITCH__)
+extern "C" void SwitchSetCurrentThreadPriority(int priority);
+#endif
+
+// createTexture can fail (the Vulkan backend returns null when vkCreateImage /
+// its memory allocation fails — typically VK_ERROR_OUT_OF_DEVICE_MEMORY on
+// large render targets). Callers here
+// historically assumed success and crashed deep inside the driver when a
+// null/half-dead texture was used. Log the failing description loudly and retry
+// at progressively halved resolution; return null only if everything fails.
+static std::unique_ptr<RenderTexture> CreateTextureChecked(const RenderTextureDesc& desc, const char* context, RenderTextureDesc* achievedOut = nullptr)
+{
+    RenderTextureDesc attempt = desc;
+
+    auto texture = g_device->createTexture(attempt);
+    if (texture == nullptr)
+    {
+        LOGFN_ERROR("!!! createTexture FAILED ({}): {}x{}x{} mips={} arr={} fmt={} flags=0x{:X} - retrying at reduced size",
+            context, desc.width, desc.height, desc.depth, desc.mipLevels, desc.arraySize,
+            int(desc.format), uint32_t(desc.flags));
+
+        // arraySize and flags are preserved (downstream builds per-layer views
+        // from the requested shape); only resolution degrades. Callers must use
+        // the achieved desc for stored dimensions or framebuffers mismatch.
+        while (texture == nullptr && (attempt.width > 1 || attempt.height > 1 || attempt.depth > 1))
+        {
+            attempt.width = std::max(1u, attempt.width / 2);
+            attempt.height = std::max(1u, attempt.height / 2);
+            attempt.depth = std::max(1u, attempt.depth / 2);
+            attempt.mipLevels = 1;
+            texture = g_device->createTexture(attempt);
+        }
+
+        if (texture != nullptr)
+            LOGFN_ERROR("... createTexture recovered at {}x{}x{} arr={} ({})",
+                attempt.width, attempt.height, attempt.depth, attempt.arraySize, context);
+        else
+            LOGFN_ERROR("!!! createTexture fallback ALSO FAILED ({})", context);
+    }
+
+    if (achievedOut != nullptr)
+        *achievedOut = attempt;
+
+    return texture;
+}
+
 static RenderDeviceCapabilities g_capabilities;
 
 static constexpr size_t NUM_FRAMES = 2;
@@ -362,12 +408,12 @@ static std::unique_ptr<RenderCommandFence> g_commandFences[NUM_FRAMES];
 static std::unique_ptr<RenderQueryPool> g_queryPools[NUM_FRAMES];
 static bool g_commandListStates[NUM_FRAMES];
 
-static Mutex g_copyMutex;
+static RecompMutex g_copyMutex;
 static std::unique_ptr<RenderCommandQueue> g_copyQueue;
 static std::unique_ptr<RenderCommandList> g_copyCommandList;
 static std::unique_ptr<RenderCommandFence> g_copyCommandFence;
 
-static Mutex g_discardMutex;
+static RecompMutex g_discardMutex;
 static std::unique_ptr<RenderCommandList> g_discardCommandList;
 static std::unique_ptr<RenderCommandFence> g_discardCommandFence;
 
@@ -406,7 +452,7 @@ enum
 
 struct TextureDescriptorAllocator
 {
-    Mutex mutex;
+    RecompMutex mutex;
     uint32_t capacity = TEXTURE_DESCRIPTOR_NULL_COUNT;
     std::vector<uint32_t> freed;
 
@@ -451,12 +497,12 @@ static std::atomic<uint32_t> g_pipelinesCreatedAsynchronously;
 static std::atomic<uint32_t> g_pipelinesDropped;
 static std::atomic<uint32_t> g_pipelinesCurrentlyCompiling;
 static std::string g_pipelineDebugText;
-static Mutex g_debugMutex;
+static RecompMutex g_debugMutex;
 #endif
 
 #ifdef PSO_CACHING
 static xxHashMap<PipelineState> g_pipelineStatesToCache;
-static Mutex g_pipelineCacheMutex;
+static RecompMutex g_pipelineCacheMutex;
 #endif
 
 static std::atomic<uint32_t> g_compilingPipelineTaskCount;
@@ -476,7 +522,7 @@ struct PipelineTask
 //    boost::shared_ptr<Hedgehog::Database::CDatabaseData> databaseData;
 };
 
-static Mutex g_pipelineTaskMutex;
+static RecompMutex g_pipelineTaskMutex;
 static std::vector<PipelineTask> g_pipelineTaskQueue;
 
 //static void EnqueuePipelineTask(PipelineTaskType type, const boost::shared_ptr<Hedgehog::Database::CDatabaseData>& databaseData)
@@ -509,7 +555,7 @@ static uint8_t* const g_vertexDeclarationCache[] =
 
 static xxHashMap<std::pair<uint32_t, std::unique_ptr<RenderSampler>>> g_samplerStates;
 
-static Mutex g_vertexDeclarationMutex;
+static RecompMutex g_vertexDeclarationMutex;
 static xxHashMap<GuestVertexDeclaration*> g_vertexDeclarations;
 
 struct UploadBuffer
@@ -1614,7 +1660,7 @@ static void CreateImGuiBackend()
     textureDesc.arraySize = 1;
     textureDesc.format = RenderFormat::R8G8B8A8_UNORM;
 
-    g_imFontTexture->textureHolder = g_device->createTexture(textureDesc);
+    g_imFontTexture->textureHolder = CreateTextureChecked(textureDesc, "imgui-font");
     g_imFontTexture->texture = g_imFontTexture->textureHolder.get();
 
     uint32_t rowPitch = (width * 4 + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
@@ -1736,7 +1782,15 @@ static void CreateImGuiBackend()
 static void CheckSwapChain()
 {
     g_swapChain->setVsyncEnabled(Config::VSync);
+#if defined(__SWITCH__)
+    // Retry a failed acquire/present on the same swap chain; only recreate on a
+    // genuine needsResize. This WSI needs every buffer-queue slot free to
+    // recreate, which is not guaranteed mid-frame, so a recreate on a transient
+    // failure can fail permanently and stall the display stack.
+    g_swapChainValid = !g_swapChain->needsResize();
+#else
     g_swapChainValid &= !g_swapChain->needsResize();
+#endif
 
     if (!g_swapChainValid)
     {
@@ -1782,7 +1836,7 @@ static void BeginCommandList()
 
             Video::WaitForGPU(); // Fine to wait for GPU, this'll only happen during resize.
 
-            g_intermediaryBackBufferTexture = g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, BACKBUFFER_FORMAT, RenderTextureFlag::RENDER_TARGET));
+            g_intermediaryBackBufferTexture = CreateTextureChecked(RenderTextureDesc::Texture2D(width, height, 1, BACKBUFFER_FORMAT, RenderTextureFlag::RENDER_TARGET), "intermediary-backbuffer");
             g_textureDescriptorSet->setTexture(g_intermediaryBackBufferTextureDescriptorIndex, g_intermediaryBackBufferTexture.get(), RenderTextureLayout::SHADER_READ);
 
             g_intermediaryBackBufferTextureWidth = width;
@@ -1995,6 +2049,12 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     bool lowEndType = deviceDescription.type != RenderDeviceType::UNKNOWN && deviceDescription.type != RenderDeviceType::DISCRETE;
     bool lowEndMemory = deviceDescription.dedicatedVideoMemory < LowEndMemoryLimit;
     bool lowEndUMA = deviceDescription.type == RenderDeviceType::UNKNOWN && g_capabilities.uma;
+#if defined(__SWITCH__)
+    // Force low-end defaults: the Switch GPU (Tegra X1) is low-end, but NVK
+    // reports the ~5 GB process mapping budget as VRAM, so the heuristics above
+    // misclassify it as high-end and default to unplayable settings.
+    lowEndType = true;
+#endif
     if (lowEndType || lowEndMemory || lowEndUMA)
     {
         // Switch to low end defaults if a non-discrete GPU was detected or a low amount of VRAM was detected.
@@ -2013,6 +2073,19 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
         Config::AntiAliasing.InaccessibleValues.emplace(EAntiAliasing::MSAA4x);
     if ((commonSampleCount & RenderSampleCount::COUNT_8) == 0)
         Config::AntiAliasing.InaccessibleValues.emplace(EAntiAliasing::MSAA8x);
+
+#if defined(__SWITCH__)
+    // MSAA hangs the GPU channel on NVK at the event renderer; keep it off.
+    Config::AntiAliasing.InaccessibleValues.emplace(EAntiAliasing::MSAA2x);
+    Config::AntiAliasing.InaccessibleValues.emplace(EAntiAliasing::MSAA4x);
+    Config::AntiAliasing.InaccessibleValues.emplace(EAntiAliasing::MSAA8x);
+
+    // 8192²x4 depth is a single 2 GB texture that cannot be allocated in one
+    // piece; the downsized fallback then mismatches the guest's render size and
+    // hangs the GPU. Cap shadows at 4096.
+    Config::ShadowResolution.InaccessibleValues.emplace(EShadowResolution::x8192);
+    Config::ShadowResolution.SnapToNearestAccessibleValue(false);
+#endif
 
     // Set Anti-Aliasing to nearest supported level.
     Config::AntiAliasing.SnapToNearestAccessibleValue(false);
@@ -2136,7 +2209,7 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
             break;
         }
 
-        texture = g_device->createTexture(desc);
+        texture = CreateTextureChecked(desc, "null-descriptor");
         textureView = texture->createTextureView(viewDesc);
 
         g_textureDescriptorSet->setTexture(i, texture.get(), RenderTextureLayout::SHADER_READ, textureView.get());
@@ -2275,7 +2348,7 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     g_backBuffer->width = 1280;
     g_backBuffer->height = 720;
     g_backBuffer->format = BACKBUFFER_FORMAT;
-    g_backBuffer->textureHolder = g_device->createTexture(RenderTextureDesc::Texture2D(1, 1, 1, BACKBUFFER_FORMAT, RenderTextureFlag::RENDER_TARGET));
+    g_backBuffer->textureHolder = CreateTextureChecked(RenderTextureDesc::Texture2D(1, 1, 1, BACKBUFFER_FORMAT, RenderTextureFlag::RENDER_TARGET), "backbuffer");
 
     Video::ComputeViewportDimensions();
     CheckSwapChain();
@@ -3475,13 +3548,14 @@ static GuestTexture* CreateTexture(uint32_t width, uint32_t height, uint32_t dep
     else
         desc.flags = RenderTextureFlag::NONE;
 
-    texture->textureHolder = g_device->createTexture(desc);
+    RenderTextureDesc achieved = desc;
+    texture->textureHolder = CreateTextureChecked(desc, "guest-texture", &achieved);
     texture->texture = texture->textureHolder.get();
 
     RenderTextureViewDesc viewDesc;
     viewDesc.format = desc.format;
     viewDesc.dimension = texture->type == ResourceType::VolumeTexture ? RenderTextureViewDimension::TEXTURE_3D : RenderTextureViewDimension::TEXTURE_2D;
-    viewDesc.mipLevels = levels;
+    viewDesc.mipLevels = achieved.mipLevels;
 
     switch (format)
     {
@@ -3499,9 +3573,12 @@ static GuestTexture* CreateTexture(uint32_t width, uint32_t height, uint32_t dep
 
     texture->textureView = texture->texture->createTextureView(viewDesc);
 
-    texture->width = width;
-    texture->height = height;
-    texture->depth = depth;
+    // Store the ACHIEVED dimensions (may be reduced by the fallback), never the
+    // requested ones — framebuffers/viewports built from these must match the
+    // actual image or the GPU hangs.
+    texture->width = achieved.width;
+    texture->height = achieved.height;
+    texture->depth = texture->type == ResourceType::ArrayTexture ? achieved.arraySize : achieved.depth;
     texture->format = desc.format;
     texture->mipLevels = viewDesc.mipLevels;
     texture->viewDimension = viewDesc.dimension;
@@ -3583,22 +3660,22 @@ static GuestSurface* CreateSurface(uint32_t width, uint32_t height, uint32_t for
         desc.depth = 1;
         desc.mipLevels = 1;
         desc.arraySize = 1;
-        // desc.multisampling.sampleCount = multiSample != 0 && Config::AntiAliasing != EAntiAliasing::None ? int32_t(Config::AntiAliasing.Value) : RenderSampleCount::COUNT_1;
-        if (multiSample == 0) {
-            desc.multisampling.sampleCount = RenderSampleCount::COUNT_1;
-        } else {
-            desc.multisampling.sampleCount = multiSample == 1 ? RenderSampleCount::COUNT_2 : RenderSampleCount::COUNT_4;
-        }
+        // A guest multisample request only produces an MSAA surface when the
+        // Anti-Aliasing setting allows it (forcing it unconditionally drove the
+        // MSAA path that hangs NVK on Switch).
+        desc.multisampling.sampleCount = multiSample != 0 && Config::AntiAliasing != EAntiAliasing::Off ? int32_t(Config::AntiAliasing.Value) : RenderSampleCount::COUNT_1;
         desc.format = ConvertFormat(format);
         desc.flags = RenderFormatIsDepth(desc.format) ? RenderTextureFlag::DEPTH_TARGET : RenderTextureFlag::RENDER_TARGET;
 
         surface = g_userHeap.AllocPhysical<GuestSurface>(RenderFormatIsDepth(desc.format) ?
             ResourceType::DepthStencil : ResourceType::RenderTarget);
 
-        surface->textureHolder = g_device->createTexture(desc);
+        RenderTextureDesc achieved = desc;
+        surface->textureHolder = CreateTextureChecked(desc, "guest-surface", &achieved);
         surface->texture = surface->textureHolder.get();
-        surface->width = width;
-        surface->height = height;
+        // Achieved dimensions, not requested — see CreateTextureChecked.
+        surface->width = achieved.width;
+        surface->height = achieved.height;
         surface->format = desc.format;
         surface->guestFormat = format;
         surface->sampleCount = desc.multisampling.sampleCount;
@@ -3631,12 +3708,53 @@ static void FlushViewport()
 {
     auto& commandList = g_commandLists[g_frame];
 
+#if defined(__SWITCH__)
+    // Capped render targets (CreateTextureChecked can shrink e.g. the 2048
+    // shadowmap to 1024) leave the guest still setting the original viewport,
+    // and rendering beyond the attachment wedges the GPU channel on NVK — a
+    // GPU hang under title takeover freezes the entire console. SCALE the
+    // viewport/scissor down to the bound target instead of clamping: the pass
+    // then covers the whole (smaller) target, so normalized-UV sampling stays
+    // correct (a plain clamp rendered shadows into one quadrant, visibly
+    // misplacing them).
+    float maxW = FLT_MAX, maxH = FLT_MAX;
+    if (g_renderTarget != nullptr)
+    {
+        maxW = float(g_renderTarget->width);
+        maxH = float(g_renderTarget->height);
+    }
+    if (g_depthStencil != nullptr)
+    {
+        maxW = std::min(maxW, float(g_depthStencil->width));
+        maxH = std::min(maxH, float(g_depthStencil->height));
+    }
+
+    float rtScale = 1.0f;
+    if (maxW != FLT_MAX && g_viewport.width > 0.0f && g_viewport.height > 0.0f)
+    {
+        const float extentW = g_viewport.x + g_viewport.width;
+        const float extentH = g_viewport.y + g_viewport.height;
+        if (extentW > maxW || extentH > maxH)
+            rtScale = std::min(maxW / extentW, maxH / extentH);
+    }
+#endif
+
     if (g_dirtyStates.viewport)
     {
         auto viewport = g_viewport;
 
         // if (viewport.minDepth > viewport.maxDepth)
         //     std::swap(viewport.minDepth, viewport.maxDepth);
+
+#if defined(__SWITCH__)
+        if (rtScale != 1.0f)
+        {
+            viewport.x *= rtScale;
+            viewport.y *= rtScale;
+            viewport.width *= rtScale;
+            viewport.height *= rtScale;
+        }
+#endif
 
         commandList->setViewports(viewport);
 
@@ -3650,6 +3768,24 @@ static void FlushViewport()
             g_viewport.y,
             g_viewport.x + g_viewport.width,
             g_viewport.y + g_viewport.height);
+
+#if defined(__SWITCH__)
+        if (rtScale != 1.0f)
+        {
+            scissorRect.left = int32_t(float(scissorRect.left) * rtScale);
+            scissorRect.top = int32_t(float(scissorRect.top) * rtScale);
+            scissorRect.right = int32_t(float(scissorRect.right) * rtScale);
+            scissorRect.bottom = int32_t(float(scissorRect.bottom) * rtScale);
+        }
+        if (maxW != FLT_MAX)
+        {
+            // Safety clamp against residual overshoot from rounding.
+            scissorRect.right = std::min<int32_t>(scissorRect.right, int32_t(maxW));
+            scissorRect.bottom = std::min<int32_t>(scissorRect.bottom, int32_t(maxH));
+            scissorRect.left = std::min(scissorRect.left, scissorRect.right);
+            scissorRect.top = std::min(scissorRect.top, scissorRect.bottom);
+        }
+#endif
 
         commandList->setScissors(scissorRect);
 
@@ -4331,7 +4467,7 @@ static RenderShader* GetOrLinkShader(GuestShader* guestShader, uint32_t specCons
 #ifdef MARATHON_RECOMP_D3D12
     if (shader == nullptr)
     {
-        static Mutex g_compiledSpecConstantLibraryBlobMutex;
+        static RecompMutex g_compiledSpecConstantLibraryBlobMutex;
         static ankerl::unordered_dense::map<uint32_t, ComPtr<IDxcBlob>> g_compiledSpecConstantLibraryBlobs;
 
         thread_local ComPtr<IDxcCompiler3> s_dxcCompiler;
@@ -5801,6 +5937,9 @@ static void SetClipPlane(GuestDevice* device, uint32_t index, const be<float>* p
 
 static std::thread g_renderThread([]
     {
+#if defined(__SWITCH__)
+    SwitchSetCurrentThreadPriority(0x2C); // must outrank guest spinners
+#endif
 #ifdef _WIN32
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         GuestThread::SetThreadName(GetCurrentThreadId(), "Render Thread");
@@ -6114,7 +6253,7 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
         desc.format = ConvertDXGIFormat(ddsDesc.format);
         desc.flags = ddsDesc.type == ddspp::TextureType::Cubemap ? RenderTextureFlag::CUBE : RenderTextureFlag::NONE;
 
-        texture.textureHolder = g_device->createTexture(desc);
+        texture.textureHolder = CreateTextureChecked(desc, "dds-texture");
         texture.texture = texture.textureHolder.get();
         texture.layout = RenderTextureLayout::COPY_DEST;
 
@@ -6224,7 +6363,7 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
 
         if (stbImage != nullptr)
         {
-            texture.textureHolder = g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, RenderFormat::R8G8B8A8_UNORM));
+            texture.textureHolder = CreateTextureChecked(RenderTextureDesc::Texture2D(width, height, 1, RenderFormat::R8G8B8A8_UNORM), "stb-texture");
             texture.texture = texture.textureHolder.get();
             texture.viewDimension = RenderTextureViewDimension::TEXTURE_2D;
             texture.layout = RenderTextureLayout::COPY_DEST;
@@ -6483,6 +6622,9 @@ static void CompilePipeline(XXH64_hash_t pipelineHash, const PipelineState& pipe
 
 static void PipelineCompilerThread()
 {
+#if defined(__SWITCH__)
+    SwitchSetCurrentThreadPriority(0x3B); // bulk compute: preemptive slot
+#endif
 #ifdef _WIN32
     int threadPriority = THREAD_PRIORITY_LOWEST;
     SetThreadPriority(GetCurrentThread(), threadPriority);

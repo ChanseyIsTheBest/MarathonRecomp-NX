@@ -1,10 +1,17 @@
 #include <cstdio>
+#include <cerrno>
 #include <stdafx.h>
 #include "guest_thread.h"
 #include <kernel/memory.h>
 #include <kernel/heap.h>
 #include <kernel/function.h>
 #include "ppc_context.h"
+#if defined(__SWITCH__)
+#include <os/logger.h>
+// os/switch/runtime_switch.cpp — see comment there for the priority scheme.
+extern "C" void SwitchSetCurrentThreadPriority(int priority);
+static constexpr int SWITCH_GUEST_THREAD_PRIORITY = 0x3B; // HOS preemptive slot
+#endif
 
 constexpr size_t PCR_SIZE = 0xAB0;
 constexpr size_t TLS_SIZE = 0x100;
@@ -45,6 +52,16 @@ GuestThreadContext::~GuestThreadContext()
 #ifdef USE_PTHREAD
 static size_t GetStackSize()
 {
+#if defined(__SWITCH__)
+    // HOST stack for the recompiled code's C++ frames only (the guest PPC stack
+    // is allocated separately in guest memory). libnx maps every pthread stack
+    // into the process's Stack region, which measured FAR smaller than assumed:
+    // with 2 MB stacks creation still hit ENOMEM at ~23 and ~46 live threads
+    // (~46-92 MB), so the region is on the order of 64 MB. 1 MB base + the
+    // ENOMEM retry ladder in GuestThreadHandle keeps creation working under
+    // pressure.
+    return 1 * 1024 * 1024;
+#else
     // Cache as this should not change.
     static size_t stackSize = 0;
     if (stackSize == 0)
@@ -64,6 +81,7 @@ static size_t GetStackSize()
         }
     }
     return stackSize;
+#endif
 }
 
 static void* GuestThreadFunc(void* arg)
@@ -73,7 +91,10 @@ static void* GuestThreadFunc(void* arg)
 static void* GuestThreadFunc(GuestThreadHandle* hThread)
 {
 #endif
-    hThread->suspended.wait(true);
+#if defined(__SWITCH__)
+    SwitchSetCurrentThreadPriority(SWITCH_GUEST_THREAD_PRIORITY);
+#endif
+    hThread->WaitUntilResumed();
     GuestThread::Start(hThread->params);
     // HACK(1)
     hThread->isFinished = true;
@@ -84,14 +105,52 @@ GuestThreadHandle::GuestThreadHandle(const GuestThreadParams& params)
     : params(params), suspended((params.flags & 0x1) != 0)
 #ifdef USE_PTHREAD
 {
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, GetStackSize());
-    const auto ret = pthread_create(&thread, &attr, GuestThreadFunc, this);
+    static std::atomic<uint32_t> s_guestThreadsCreated{ 0 };
+
+    size_t stackSize = GetStackSize();
+    int ret = 0;
+    for (;;)
+    {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        const auto stackResult = pthread_attr_setstacksize(&attr, stackSize);
+        if (stackResult != 0)
+            fprintf(stderr, "pthread_attr_setstacksize failed with error code 0x%X.\n", stackResult);
+
+        ret = pthread_create(&thread, &attr, GuestThreadFunc, this);
+        pthread_attr_destroy(&attr);
+
+        if (ret == 0)
+            break;
+
+#if defined(__SWITCH__)
+        // The Stack region is a small fixed VA budget shared by every live
+        // thread's stack; under load creation fails with ENOMEM. Retry with a
+        // smaller stack instead of handing the game a dead thread handle — a
+        // missing worker deadlocks the game's job system (and with it the
+        // audio-callback thread), which presents as a whole-console freeze.
+        if (ret == ENOMEM && stackSize > 256 * 1024)
+        {
+            stackSize /= 2;
+            LOGFN_WARNING("guest pthread_create ENOMEM, retrying with stackSize=0x{:X} ({} threads created so far)",
+                stackSize, s_guestThreadsCreated.load(std::memory_order_relaxed));
+            continue;
+        }
+#endif
+        break;
+    }
+
     if (ret != 0) {
         fprintf(stderr, "pthread_create failed with error code 0x%X.\n", ret);
+#if defined(__SWITCH__)
+        LOGFN_ERROR("!!! guest pthread_create FAILED: rc=0x{:X} after {} guest threads (stackSize=0x{:X})",
+            ret, s_guestThreadsCreated.load(std::memory_order_relaxed), stackSize);
+#endif
         return;
     }
+
+    s_guestThreadsCreated.fetch_add(1, std::memory_order_relaxed);
+    threadCreated = true;
 }
 #else
 , thread(GuestThreadFunc, this)
@@ -102,7 +161,8 @@ GuestThreadHandle::GuestThreadHandle(const GuestThreadParams& params)
 GuestThreadHandle::~GuestThreadHandle()
 {
 #ifdef USE_PTHREAD
-    pthread_join(thread, nullptr);
+    if (threadCreated && !joined.exchange(true))
+        pthread_join(thread, nullptr);
 #else
     if (thread.joinable())
         thread.join();
@@ -127,12 +187,36 @@ uint32_t GuestThreadHandle::GetThreadId() const
 #endif
 }
 
+void GuestThreadHandle::Suspend()
+{
+    suspended.store(true, std::memory_order_release);
+}
+
+void GuestThreadHandle::Resume()
+{
+    suspended.store(false, std::memory_order_release);
+    suspendCv.notify_all();
+}
+
+void GuestThreadHandle::WaitUntilResumed()
+{
+    if (!suspended.load(std::memory_order_acquire))
+        return;
+
+    std::unique_lock lock(suspendMutex);
+    suspendCv.wait(lock, [&]
+    {
+        return !suspended.load(std::memory_order_acquire);
+    });
+}
+
 uint32_t GuestThreadHandle::Wait(uint32_t timeout)
 {
     if (timeout == INFINITE || isFinished.load()) // HACK(1): isFinished
     {
 #ifdef USE_PTHREAD
-        pthread_join(thread, nullptr);
+        if (threadCreated && !joined.exchange(true))
+            pthread_join(thread, nullptr);
 #else
         if (thread.joinable())
             thread.join();
@@ -152,7 +236,8 @@ uint32_t GuestThreadHandle::Wait(uint32_t timeout)
     else
     {
 #ifdef USE_PTHREAD
-        pthread_join(thread, nullptr);
+        if (threadCreated && !joined.exchange(true))
+            pthread_join(thread, nullptr);
 #else
         auto start = std::chrono::steady_clock::now();
         while (thread.joinable())
@@ -171,6 +256,10 @@ uint32_t GuestThreadHandle::Wait(uint32_t timeout)
 
 uint32_t GuestThread::Start(const GuestThreadParams& params)
 {
+#if defined(__SWITCH__)
+    // The calling thread becomes a guest thread (it may spin like one).
+    SwitchSetCurrentThreadPriority(SWITCH_GUEST_THREAD_PRIORITY);
+#endif
     const auto procMask = (uint8_t)(params.flags >> 24);
     const auto cpuNumber = procMask == 0 ? 0 : 7 - std::countl_zero(procMask);
 

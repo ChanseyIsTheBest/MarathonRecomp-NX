@@ -14,6 +14,7 @@ constexpr auto TITLE_OUTRO_FRAMES = (1.0 / 60.0) * 25.0;
 constexpr auto TITLE_OPTION_OUTRO_TOTAL_FRAMES = TITLE_OPTION_OUTRO_FRAMES + TITLE_OUTRO_FRAMES;
 
 static double g_titleProceedOutroTime{};
+static bool s_achievementsReset = false;
 static double g_titleExitOutroTime{};
 
 static bool g_quitMessageOpen{};
@@ -157,9 +158,14 @@ PPC_FUNC(sub_825126A0)
 
         case Sonicteam::TitleTask::TitleState_OptionsProceed:
         {
-            // Reset achievements on new game.
-            if (pTitleTask->m_SelectedIndex == 0)
+            // Reset achievements on new game — ONCE. This state runs every
+            // frame of the outro animation; resetting per frame wrote the
+            // achievements file to the SD card 30-70 times in a second while
+            // loader threads hammered the same card, wedging the fs layer
+            // (process-wide freeze: every fs call blocks forever).
+            if (pTitleTask->m_SelectedIndex == 0 && !s_achievementsReset)
             {
+                s_achievementsReset = true;
                 LOGN("Resetting achievements...");
 
                 AchievementManager::Reset();
@@ -179,6 +185,7 @@ PPC_FUNC(sub_825126A0)
 
         case Sonicteam::TitleTask::TitleState_Proceed:
         {
+            s_achievementsReset = false;
             g_saveDataExists = std::filesystem::exists(GetSaveFilePath(false));
 
             // Redirect PRESS START proceed to options open.

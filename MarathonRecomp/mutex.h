@@ -2,13 +2,13 @@
 
 #ifdef _WIN32
 
-struct Mutex : CRITICAL_SECTION
+struct RecompMutex : CRITICAL_SECTION
 {
-    Mutex()
+    RecompMutex()
     {
         InitializeCriticalSection(this);
     }
-    ~Mutex()
+    ~RecompMutex()
     {
         DeleteCriticalSection(this);
     }
@@ -26,6 +26,12 @@ struct Mutex : CRITICAL_SECTION
 
 #else
 
-using Mutex = std::mutex;
+using RecompMutex = std::mutex;
 
+#endif
+
+// libnx defines a C "Mutex" type in the global namespace, so the alias is
+// only provided on platforms where it cannot conflict.
+#if !defined(__SWITCH__)
+using Mutex = RecompMutex;
 #endif

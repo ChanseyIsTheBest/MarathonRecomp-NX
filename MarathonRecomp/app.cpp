@@ -1,7 +1,10 @@
 #include "app.h"
+#include <apu/audio.h>
 #include <gpu/video.h>
 #include <install/installer.h>
 #include <kernel/function.h>
+#include <kernel/memory.h>
+#include <string_view>
 #include <os/process.h>
 #include <os/logger.h>
 #include <patches/audio_patches.h>
@@ -68,6 +71,17 @@ PPC_FUNC(sub_8262A568)
 PPC_FUNC_IMPL(__imp__sub_825EA610);
 PPC_FUNC(sub_825EA610)
 {
+#if defined(__SWITCH__)
+    // Hold off guest audio callbacks until the game's first update.
+    static bool s_guestAudioEnabled = false;
+    if (!s_guestAudioEnabled)
+    {
+        XAudioSetGuestCallbacksEnabled(true);
+        LOGN("Switch XAudio guest callbacks enabled");
+        s_guestAudioEnabled = true;
+    }
+#endif
+
     Video::WaitOnSwapChain();
 
     // Correct small delta time errors.
@@ -116,8 +130,24 @@ PPC_FUNC(sub_82582648)
 
     auto pFile = reinterpret_cast<File*>(base + ctx.r5.u32);
 
+#if defined(__SWITCH__)
+    // The guest owns this filename pointer and treats it as opaque; only this
+    // debug hook ever dereferences it, and it is intermittently garbage. Read
+    // it without any chance of faulting: a sane bounded length, fully inside
+    // committed guest memory, and formatted as an explicitly sized view so no
+    // strlen scan can run off into unmapped pages.
+    const uint32_t pathOffset = pFile->pFilePath.ptr;
+    const uint32_t pathLength = pFile->Length;
+    if (pathOffset != 0 && pathLength > 0 && pathLength < 0x1000 &&
+        g_memory.IsRangeCommitted(pathOffset, pathLength))
+    {
+        LOGFN_UTILITY("Loading file: {}",
+            std::string_view(reinterpret_cast<const char*>(base + pathOffset), pathLength));
+    }
+#else
     if (pFile->pFilePath && pFile->Length > 0)
         LOGFN_UTILITY("Loading file: {}", pFile->pFilePath.get());
+#endif
 
     __imp__sub_82582648(ctx, base);
 }

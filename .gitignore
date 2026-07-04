@@ -404,3 +404,11 @@ FodyWeavers.xsd
 
 UnleashedRecompLib/build
 UnleashedRecompLib/ppc*
+build/
+dist/
+
+# Nintendo Switch port - build outputs and prebuilt binaries (do not commit)
+/build*/
+/dist/
+*.nro
+thirdparty/nvk-switch/lib/*.a
