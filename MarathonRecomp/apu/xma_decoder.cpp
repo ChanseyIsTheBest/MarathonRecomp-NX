@@ -11,6 +11,7 @@
 
 #include "xma_decoder.h"
 #if defined(__SWITCH__)
+#include <chrono>
 #include <os/logger.h>
 extern "C" void SwitchSetCurrentThreadPriority(int priority);
 #endif
@@ -375,13 +376,23 @@ void DecoderThreadFunc(XmaPlayback *playback) {
     while (playback->isRunning) {
         std::unique_lock<std::mutex> lock(playback->mutex);
 
-        playback->cv.wait(lock, [&] {
+        auto ready = [&] {
             return (!playback->isRunning || (playback->outputBufferValid == 1 &&
                                              playback->IsAnyInputBufferValid())) &&
                    !playback->isLocked.load();
-        });
+        };
+#if defined(__SWITCH__)
+        // Notify-driven wait, 2 ms liveness cap. No predicate on purpose: a
+        // predicate makes wait_for return instantly while there is decodable
+        // state, busy-spinning the decoder and starving the audio pump. The 2 ms
+        // timeout covers a dropped notify_one (a bare cv.wait would deadlock).
+        (void)ready;
+        playback->cv.wait_for(lock, std::chrono::milliseconds(2));
+#else
+        playback->cv.wait(lock, ready);
+#endif
 
-        if (!playback->outputBufferValid)
+        if (!playback->outputBufferValid || playback->isLocked.load())
             continue;
 
         if (!playback->isRunning)

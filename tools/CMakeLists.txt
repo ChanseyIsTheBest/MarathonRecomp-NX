@@ -1,6 +1,6 @@
 option(MARATHON_RECOMP_OPTIMIZE_TOOLS "Apply compiler optimizations to build tools." ON)
 if (MARATHON_RECOMP_OPTIMIZE_TOOLS)
-    if (WIN32)
+    if (MSVC)
         add_compile_options(/O2)
     else()
         add_compile_options(-O3)
