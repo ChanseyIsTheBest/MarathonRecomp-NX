@@ -10,14 +10,17 @@ set -euo pipefail
 : "${DEVKITPRO:=/opt/devkitpro}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 8)}"
 FFMPEG_TAG="${FFMPEG_TAG:-n7.1}"   # must match thirdparty/ffmpeg-core/include public headers
+CLANGARM64="${CLANGARM64:-/c/msys64/clangarm64/bin}"
+HOST_CC="${HOST_CC:-$CLANGARM64/clang.exe}"
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work="${FFMPEG_WORKDIR:-$root_dir/build/ffmpeg-switch}"
 dest="$root_dir/thirdparty/ffmpeg-core/switch"
 patch="$root_dir/tools/switch/ffmpeg-xmaframes.patch"
 
-export PATH="$DEVKITPRO/devkitA64/bin:$PATH"
+export PATH="$CLANGARM64:$DEVKITPRO/devkitA64/bin:$PATH"
 command -v aarch64-none-elf-gcc >/dev/null || { echo "devkitA64 gcc not found; set DEVKITPRO." >&2; exit 2; }
+[ -x "$HOST_CC" ] || { echo "ARM64 host clang not found: $HOST_CC" >&2; exit 2; }
 
 echo "== FFmpeg $FFMPEG_TAG: fetch =="
 if [ ! -d "$work/.git" ]; then
@@ -27,12 +30,13 @@ fi
 cd "$work"
 
 echo "== FFmpeg: apply XMAFRAMES decoder patch =="
-if git apply --check "$patch" 2>/dev/null; then
-  git apply "$patch"
-elif git apply --reverse --check "$patch" 2>/dev/null; then
+if git apply --check --ignore-space-change --whitespace=nowarn "$patch" 2>/dev/null; then
+  git apply --ignore-space-change --whitespace=nowarn "$patch"
+elif git apply --reverse --check --ignore-space-change --whitespace=nowarn "$patch" 2>/dev/null; then
   echo "  already applied"
 else
-  echo "  WARNING: patch neither applies nor is applied cleanly; continuing" >&2
+  echo "  ERROR: FFmpeg patch neither applies nor is already applied" >&2
+  exit 2
 fi
 
 echo "== FFmpeg: configure (minimal avcodec+avutil, xmaframes only) =="
@@ -41,6 +45,7 @@ if [ ! -f ffbuild/config.mak ]; then
   ./configure \
     --prefix="$work/install" \
     --enable-cross-compile --cross-prefix=aarch64-none-elf- \
+    --host-cc="$HOST_CC" \
     --arch=aarch64 --cpu=cortex-a57 --target-os=none \
     --enable-pic --enable-static --disable-shared \
     --disable-programs --disable-doc --disable-autodetect --disable-network --disable-debug \

@@ -36,7 +36,8 @@ These are `.gitignore`d and must be provided locally:
 |---|---|---|
 | `default.xex` | `MarathonRecompLib/private/` | from your game dump (root) |
 | `shader.arc`, `shader_lt.arc` | `MarathonRecompLib/private/` | from `xenon/archives` |
-| **NVK Vulkan driver** | `NVK_ROOT` env var | closed build; **not shipped**. Must contain `builddir-switch/src/nouveau/vulkan/libvulkan.a` |
+| **NVK Vulkan driver** | `NVK_ROOT` env var | closed build; **not shipped**. Accepts the relocatable Switch SDK (`lib/libvulkan.a`) or a legacy Mesa build tree (`builddir-switch/src/nouveau/vulkan/libvulkan.a`). |
+| `Lossless.dll` (optional) | `sdmc:/switch/MarathonRecomp/lsfg/` | Required at runtime only when LSFG-VK frame generation is enabled; not bundled. |
 
 ## 3. Build
 
@@ -78,3 +79,7 @@ outputs are reused. Delete `build/` (and the generated `MarathonRecompLib/ppc/`
   `.gitignore`d — they're reproduced by the scripts, not stored in git.
 - An unstripped `build/switch-app/MarathonRecomp/MarathonRecomp.debug.elf` is
   kept for symbolicating crash addresses.
+- **LSFG-VK frame generation** is disabled by default. Enable it in Video
+  options after placing `Lossless.dll` in `sdmc:/switch/MarathonRecomp/lsfg/`,
+  then restart the game. Its pipeline cache is written under
+  `sdmc:/switch/MarathonRecomp/cache/`.

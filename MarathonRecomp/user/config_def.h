@@ -60,6 +60,11 @@ CONFIG_DEFINE_ENUM_LOCALISED("Video", EAspectRatio, AspectRatio, EAspectRatio::A
 CONFIG_DEFINE_LOCALISED("Video", float, ResolutionScale, 1.0f, false);
 CONFIG_DEFINE_LOCALISED("Video", bool, Fullscreen, true, false);
 CONFIG_DEFINE_LOCALISED("Video", bool, VSync, true, false);
+#if defined(__SWITCH__)
+CONFIG_DEFINE_LOCALISED("Video", bool, FrameGeneration, false, true);
+CONFIG_DEFINE_HIDDEN("Video", float, FrameGenerationFlowScale, 0.25f, true);
+CONFIG_DEFINE_HIDDEN("Video", bool, FrameGenerationPerformanceMode, true, true);
+#endif
 CONFIG_DEFINE_ENUM("Video", ETripleBuffering, TripleBuffering, ETripleBuffering::Auto, false);
 CONFIG_DEFINE_LOCALISED("Video", int32_t, FPS, 60, false);
 CONFIG_DEFINE("Video", bool, ShowFPS, false, false);

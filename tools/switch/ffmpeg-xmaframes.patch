@@ -11,8 +11,8 @@ Signed-off-by: Isaac Marovitz <isaacryu@icloud.com>
  libavcodec/codec_desc.c |  7 ++++
  libavcodec/codec_id.h   |  1 +
  libavcodec/version.c    |  2 +-
- libavcodec/wmaprodec.c  | 89 +++++++++++++++++++++++++++++++++++++++++
- 7 files changed, 101 insertions(+), 1 deletion(-)
+ libavcodec/wmaprodec.c  | 94 +++++++++++++++++++++++++++++++++++++++++++-
+ 7 files changed, 105 insertions(+), 2 deletions(-)
 
 diff --git a/configure b/configure
 index ffa407d53d55a..bd30ae76e5655 100755
@@ -109,7 +109,19 @@ index a6c4a756324d0..fcaf3905831e4 100644
      } else if (avctx->codec_id == AV_CODEC_ID_WMAPRO && avctx->extradata_size >= 18) {
          s->decode_flags    = AV_RL16(edata_ptr+14);
          channel_mask       = AV_RL32(edata_ptr+2);
-@@ -2088,6 +2093,74 @@ static void xma_flush(AVCodecContext *avctx)
+@@ -431,7 +436,10 @@ static av_cold int decode_init(WMAProDecodeCtx *s, AVCodecContext *avctx, int nu
+     }
+ 
+     /** frame info */
+-    s->skip_frame = 1; /* skip first frame */
++    if (avctx->codec_id != AV_CODEC_ID_WMAPRO)
++        s->skip_frame = 0;
++    else
++        s->skip_frame = 1; /* skip first frame */
+ 
+     s->packet_loss = 1;
+     s->len_prefix  = (s->decode_flags & 0x40);
+@@ -2088,6 +2096,74 @@ static void xma_flush(AVCodecContext *avctx)
      s->flushed = 0;
  }
  
@@ -184,7 +196,7 @@ index a6c4a756324d0..fcaf3905831e4 100644
  /**
   *@brief wmapro decoder
   */
-@@ -2150,3 +2223,19 @@ const FFCodec ff_xma2_decoder = {
+@@ -2150,3 +2226,19 @@ const FFCodec ff_xma2_decoder = {
                                                        AV_SAMPLE_FMT_NONE },
      .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
  };

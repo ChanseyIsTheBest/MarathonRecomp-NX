@@ -5,6 +5,9 @@
 #include <kernel/function.h>
 #include <kernel/heap.h>
 #include <condition_variable>
+#include <cstring>
+#include <memory>
+#include <vector>
 #if defined(__SWITCH__)
 #include <pthread.h>
 #endif
@@ -27,7 +30,7 @@ constexpr uint32_t kBytesPerSample = 2;
 constexpr uint32_t kSamplesPerFrame = 512;
 constexpr uint32_t kBytesPerFrameChannel = kSamplesPerFrame * kBytesPerSample;
 
-struct XmaPlayback {
+struct XmaPlaybackStream {
     uint32_t sampleRate;
     uint32_t outputBufferSize;
     uint32_t channelCount;
@@ -49,7 +52,7 @@ struct XmaPlayback {
     // xenia
     std::array<uint8_t, kBytesPerPacketData * 2> inputBuffer;
     std::array<uint8_t, 1 + 4096> xmaFrame;
-    std::array<uint8_t, kBytesPerFrameChannel * 2> rawFrame;
+    std::vector<uint8_t> rawFrame;
     uint32_t outputBufferBlockCount = 0;
     uint32_t outputBufferReadOffset = 0;
     uint32_t outputBufferWriteOffset = 0;
@@ -89,17 +92,23 @@ struct XmaPlayback {
     std::mutex mutex;
     std::condition_variable cv;
     std::atomic<bool> isLocked { false };
+    std::atomic<bool> decoderWorking { false };
     std::atomic<bool> isRunning { true };
 
-    XmaPlayback(uint32_t sampleRate, uint32_t outputBufferSize,
+    XmaPlaybackStream(uint32_t sampleRate, uint32_t outputBufferSize,
                 uint32_t channelCount, uint32_t subframes)
                 : sampleRate(sampleRate), outputBufferSize(outputBufferSize),
                   channelCount(channelCount), subframes(subframes),
+                  rawFrame(kBytesPerFrameChannel * channelCount),
                   outputRb(nullptr, 0) {
         outputBufferBlockCount =
                 (((channelCount * outputBufferSize) << 15) & 0x7C00000) >> 22;
-        outputBuffer =
-                g_memory.MapVirtual(g_userHeap.AllocPhysical((size_t)0x2000, 0));
+        void* outputMemory = g_userHeap.AllocPhysical((size_t)0x2000, 0);
+        if (!outputMemory) {
+            throw std::runtime_error("Failed to allocate XMA output buffer");
+        }
+        std::memset(outputMemory, 0, 0x2000);
+        outputBuffer = g_memory.MapVirtual(outputMemory);
 
         codec = avcodec_find_decoder(AV_CODEC_ID_XMAFRAMES);
         if (!codec) {
@@ -156,7 +165,7 @@ struct XmaPlayback {
         return inputBuffer1Valid || inputBuffer2Valid;
     }
 
-    ~XmaPlayback() {
+    ~XmaPlaybackStream() {
         {
             std::lock_guard<std::mutex> lock(mutex);
             isRunning = false;
@@ -173,5 +182,41 @@ struct XmaPlayback {
             decoderThread.join();
         }
 #endif
+
+        if (av_packet_) {
+            av_packet_free(&av_packet_);
+        }
+        if (av_frame_) {
+            av_frame_free(&av_frame_);
+        }
+        if (codec_ctx) {
+            avcodec_free_context(&codec_ctx);
+        }
+        if (outputBuffer) {
+            g_userHeap.Free(g_memory.Translate(outputBuffer));
+            outputBuffer = 0;
+        }
+    }
+};
+
+struct XmaPlayback {
+    std::vector<std::unique_ptr<XmaPlaybackStream>> streams;
+
+    XmaPlayback(uint32_t streamCount, const XMAPLAYBACKINIT *init) {
+        streams.reserve(streamCount);
+
+        for (uint32_t i = 0; i < streamCount; i++) {
+            streams.emplace_back(std::make_unique<XmaPlaybackStream>(
+                init[i].sampleRate.get(), init[i].outputBufferSize.get(),
+                init[i].channelCount, init[i].subframes));
+        }
+    }
+
+    XmaPlaybackStream *GetStream(uint32_t stream) {
+        return stream < streams.size() ? streams[stream].get() : nullptr;
+    }
+
+    const XmaPlaybackStream *GetStream(uint32_t stream) const {
+        return stream < streams.size() ? streams[stream].get() : nullptr;
     }
 };

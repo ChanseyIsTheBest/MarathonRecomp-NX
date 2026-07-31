@@ -205,6 +205,11 @@ int main(int argc, char *argv[])
     // optimization, so disable it entirely before the driver initializes.
     setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
     setenv("MESA_GLSL_CACHE_DISABLE", "1", 1);
+
+    // Create the optional LSFG shader directory up front so users only need
+    // to copy Lossless.dll into it before enabling Frame Generation.
+    std::error_code lsfgDirectoryError;
+    std::filesystem::create_directories(GetUserPath() / "lsfg", lsfgDirectoryError);
 #endif
 
     os::process::CheckConsole();

@@ -10,7 +10,8 @@
 #
 # Inputs you supply (kept out of the repo):
 #   - Game files in MarathonRecompLib/private/ : default.xex, shader.arc, shader_lt.arc
-#   - NVK Vulkan driver: NVK_ROOT -> extracted mesa build dir containing
+#   - NVK Vulkan driver: NVK_ROOT -> extracted Switch SDK containing
+#         lib/libvulkan.a, or a legacy Mesa tree containing
 #         builddir-switch/src/nouveau/vulkan/libvulkan.a
 #     (closed/unshipped; provide your own.)
 #
@@ -23,7 +24,13 @@
 set -euo pipefail
 
 : "${DEVKITPRO:=/opt/devkitpro}"
-: "${NVK_ROOT:?Set NVK_ROOT to your extracted mesa-nvk dir (contains builddir-switch/src/nouveau/vulkan/libvulkan.a).}"
+# clangarm64 cmake resolves native Windows paths, not the msys /opt mount.
+DEVKITPRO_SHELL="$DEVKITPRO"
+if command -v cygpath >/dev/null 2>&1; then
+  DEVKITPRO="$(cygpath -m "$DEVKITPRO")"
+  DEVKITPRO_SHELL="$(cygpath -u "$DEVKITPRO")"
+fi
+: "${NVK_ROOT:?Set NVK_ROOT to your extracted Mesa/NVK Switch SDK or build tree.}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 8)}"
 
 CLANGARM64="${CLANGARM64:-/c/msys64/clangarm64/bin}"
@@ -34,7 +41,16 @@ NINJA="$CLANGARM64/ninja.exe"
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root_dir"
 
-NVK_LIB="$NVK_ROOT/builddir-switch/src/nouveau/vulkan/libvulkan.a"
+if [ -f "$NVK_ROOT/lib/libvulkan.a" ]; then
+  NVK_LIB="$NVK_ROOT/lib/libvulkan.a"
+  NVK_EXTRA_LIBS="-L$NVK_ROOT/lib;zstd;z;nx"
+elif [ -f "$NVK_ROOT/builddir-switch/src/nouveau/vulkan/libvulkan.a" ]; then
+  NVK_LIB="$NVK_ROOT/builddir-switch/src/nouveau/vulkan/libvulkan.a"
+  NVK_EXTRA_LIBS="drm_nouveau;zstd;z;nx"
+else
+  echo "NVK driver not found under $NVK_ROOT (expected lib/libvulkan.a or builddir-switch/src/nouveau/vulkan/libvulkan.a)." >&2
+  exit 2
+fi
 DXC_X64="$root_dir/tools/XenosRecomp/thirdparty/dxc-bin/bin/x64"
 
 log() { echo; echo "==== $* ===="; }
@@ -53,9 +69,15 @@ apply_patch() { # $1 patch file, $2 submodule dir
   local p="$root_dir/patches/$1"
   [ -f "$p" ] || return 0
   ( cd "$2" 2>/dev/null || exit 0
-    if   git apply --check "$p" 2>/dev/null; then git apply "$p"; echo "  applied $1"
-    elif git apply --reverse --check "$p" 2>/dev/null; then echo "  $1 already applied"
-    else echo "  WARNING: $1 did not apply cleanly" >&2; fi )
+    if git apply --check --ignore-space-change --whitespace=nowarn "$p" 2>/dev/null; then
+      git apply --ignore-space-change --whitespace=nowarn "$p"
+      echo "  applied $1"
+    elif git apply --reverse --check --ignore-space-change --whitespace=nowarn "$p" 2>/dev/null; then
+      echo "  $1 already applied"
+    else
+      echo "  ERROR: $1 did not apply cleanly" >&2
+      exit 2
+    fi )
 }
 apply_patch volk.patch                    thirdparty/plume/contrib/volk
 apply_patch plume.patch                   thirdparty/plume
@@ -87,7 +109,7 @@ PATH="$CLANG64:$DXC_X64:$PATH" CC="$CLANG64/clang.exe" CXX="$CLANG64/clang++.exe
 
 # ------------------------------------------------------- 4. recompile PPC from XEX
 log "4/8 recompile PPC from default.xex"
-build/host-tools/tools/XenonRecomp/XenonRecomp/XenonRecomp.exe \
+PATH="$CLANGARM64:$PATH" build/host-tools/tools/XenonRecomp/XenonRecomp/XenonRecomp.exe \
   MarathonRecompLib/config/Marathon.toml tools/XenonRecomp/XenonUtils/ppc_context.h
 
 # --------------------------------------------------------- 5. generate shaders
@@ -95,22 +117,23 @@ log "5/8 generate shader cache + app shaders"
 U8="build/host-tools/tools/u8extract/u8extract.exe"
 XS="build/host-tools-x64/tools/XenosRecomp/XenosRecomp/XenosRecomp.exe"
 rm -rf MarathonRecompLib/private/shader; mkdir -p MarathonRecompLib/private/shader
-"$U8" MarathonRecompLib/private/shader.arc    MarathonRecompLib/private/shader
-"$U8" MarathonRecompLib/private/shader_lt.arc MarathonRecompLib/private/shader
-PATH="$DXC_X64:$PATH" "$XS" MarathonRecompLib/private/shader \
+PATH="$CLANGARM64:$PATH" "$U8" MarathonRecompLib/private/shader.arc    MarathonRecompLib/private/shader
+PATH="$CLANGARM64:$PATH" "$U8" MarathonRecompLib/private/shader_lt.arc MarathonRecompLib/private/shader
+PATH="$CLANG64:$DXC_X64:$PATH" "$XS" MarathonRecompLib/private/shader \
   MarathonRecompLib/shader/shader_cache.cpp tools/XenosRecomp/XenosRecomp/shader_common.h
 bash tools/generate-switch-app-shaders.sh
 
 # ------------------------------------------------------------------ 6. ffmpeg
 log "6/8 cross-build FFmpeg (avcodec+avutil, XMAFRAMES)"
-DEVKITPRO="$DEVKITPRO" JOBS="$JOBS" bash tools/build-switch-ffmpeg.sh
+DEVKITPRO="$DEVKITPRO_SHELL" JOBS="$JOBS" bash tools/build-switch-ffmpeg.sh
 
 # ------------------------------------------------- 7. configure + build the app
 log "7/8 configure + cross-compile the Switch app"
 export DEVKITPRO
-PATH="$DEVKITPRO/devkitA64/bin:$PATH" \
+PATH="$CLANGARM64:$DEVKITPRO/devkitA64/bin:$PATH" \
 "$CMAKE" -S . -B build/switch-app -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=toolchains/switch-devkitA64.cmake -DCMAKE_BUILD_TYPE=Release \
+  -DDEVKITPRO="$DEVKITPRO" \
   -DMARATHON_RECOMP_SWITCH=ON \
   -DMARATHON_RECOMP_SWITCH_USE_PREGENERATED_SHADERS=ON \
   -DMARATHON_RECOMP_SWITCH_USE_PREGENERATED_APP_SHADERS=ON \
@@ -118,11 +141,12 @@ PATH="$DEVKITPRO/devkitA64/bin:$PATH" \
   -DMARATHON_RECOMP_HOST_TOOLS_DIR="$root_dir/build/host-tools" \
   -DMARATHON_RECOMP_HOST_FILE_TO_C="$root_dir/build/host-tools/tools/file_to_c/file_to_c.exe" \
   -DPLUME_PLATFORM_SWITCH=ON -DPLUME_SWITCH_NVK_ROOT="$NVK_ROOT" -DPLUME_SWITCH_NVK_LIBRARY="$NVK_LIB" \
+  -DPLUME_SWITCH_NVK_EXTRA_LIBS="$NVK_EXTRA_LIBS" \
   -DCMAKE_MAKE_PROGRAM="$NINJA"
-PATH="$DEVKITPRO/devkitA64/bin:$PATH" "$CMAKE" --build build/switch-app -j"$JOBS" --target MarathonRecomp
+PATH="$CLANGARM64:$DEVKITPRO/devkitA64/bin:$PATH" "$CMAKE" --build build/switch-app -j"$JOBS" --target MarathonRecomp
 
 # ------------------------------------------------------------------ 8. package
 log "8/8 package NRO"
-DEVKITPRO="$DEVKITPRO" bash tools/package-switch-nro.sh
+DEVKITPRO="$DEVKITPRO_SHELL" bash tools/package-switch-nro.sh
 
 echo; echo "==== Switch build complete: dist/switch/MarathonRecomp.nro ===="
