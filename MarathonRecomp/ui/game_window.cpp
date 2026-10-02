@@ -8,6 +8,12 @@
 
 #if defined(__SWITCH__)
 #include <switch.h>
+#include <sys/stat.h>
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #else
 #include <SDL_syswm.h>
 #endif
@@ -21,6 +27,182 @@
 
 bool m_isFullscreenKeyReleased = true;
 bool m_isResizing = false;
+
+#if defined(__SWITCH__)
+namespace
+{
+    // [Switch] The window's size, per console mode, from sdmc:/switch/MarathonRecomp/resolution.txt (written with the
+    // defaults when it is missing). The game renders at the window's size (app.cpp gives it the viewport when the game
+    // starts), so this is its resolution. The game makes its render targets once, at that size, so the size is taken
+    // at start, from the mode the console starts in; docking or undocking later keeps it (the console scales the
+    // picture to the screen), and the other mode's size applies from the next start. UnleashedRecomp-NX, whose game
+    // remakes its render targets, makes its swap chain again at the new mode's size instead.
+    constexpr const char* RESOLUTION_FILE = "sdmc:/switch/MarathonRecomp/resolution.txt";
+    constexpr int DEFAULT_DOCKED_HEIGHT = 900;
+    constexpr int DEFAULT_HANDHELD_HEIGHT = 720;
+    constexpr int MIN_WINDOW_HEIGHT = 480;
+    constexpr int MAX_WINDOW_HEIGHT = 1080; // the largest NWindow the console shows
+
+    constexpr const char* RESOLUTION_FILE_TEXT =
+        "# MarathonRecomp-NX window size. The game renders at the window's size, so this is its resolution.\n"
+        "# One line per console mode: the height in pixels, from 480 to 1080. The width follows for 16:9:\n"
+        "#   480 = 854x480, 540 = 960x540, 576 = 1024x576, 648 = 1152x648, 720 = 1280x720,\n"
+        "#   810 = 1440x810, 864 = 1536x864, 900 = 1600x900, 1080 = 1920x1080 (any height in between works).\n"
+        "# A width and height also work (docked=1600x900); a size outside 480-1080 lines is brought into range.\n"
+        "# The size is taken when the game starts, from the mode the console starts in. Docking or undocking while\n"
+        "# playing keeps the size the game started with (the console scales the picture to the screen); restart the\n"
+        "# game to use the other mode's size. A larger window costs GPU time (1080p draws 2.25 times the pixels of 720p).\n"
+        "docked=900\n"
+        "handheld=720\n";
+
+    // Docked: the console's operation mode when the game starts (no applet message loop runs here, so it is read
+    // once); the default display resolution if that fails (1080 lines when docked, 720 in handheld).
+    bool QueryDocked()
+    {
+        const AppletOperationMode mode = appletGetOperationMode();
+        if (mode == AppletOperationMode_Console)
+            return true;
+
+        if (mode == AppletOperationMode_Handheld)
+            return false;
+
+        s32 width = 0;
+        s32 height = 0;
+        return R_SUCCEEDED(appletGetDefaultDisplayResolution(&width, &height)) && height >= 1080;
+    }
+
+    // The 16:9 width of a height, even.
+    int WidthForHeight(int height)
+    {
+        const int width = (height * 16 + 4) / 9;
+        return width + (width & 1);
+    }
+
+    // "1080", "1080p" or "1920x1080" (the height is what counts for a 16:9 window; a width is kept when given). 0 when
+    // the value is not a size.
+    void ParseSize(const char* value, int& width, int& height)
+    {
+        width = 0;
+        height = 0;
+        char* end = nullptr;
+        const long first = strtol(value, &end, 10);
+        if (end == value || first <= 0)
+            return;
+
+        if (*end == 'x' || *end == 'X' || *end == '*')
+        {
+            const char* rest = end + 1;
+            const long second = strtol(rest, &end, 10);
+            if (end == rest || second <= 0)
+                return;
+
+            width = int(first);
+            height = int(second);
+            return;
+        }
+
+        height = int(first);
+    }
+
+    void WriteDefaultResolutionFile()
+    {
+        mkdir("sdmc:/switch", 0777);
+        mkdir("sdmc:/switch/MarathonRecomp", 0777);
+        if (FILE* file = fopen(RESOLUTION_FILE, "w"))
+        {
+            fputs(RESOLUTION_FILE_TEXT, file);
+            fclose(file);
+        }
+    }
+
+    struct WindowSize
+    {
+        int width;
+        int height;
+    };
+
+    WindowSize ClampWindowSize(int width, int height, int defaultHeight)
+    {
+        if (height <= 0)
+            height = defaultHeight;
+
+        height = std::clamp(height, MIN_WINDOW_HEIGHT, MAX_WINDOW_HEIGHT);
+        if (width <= 0)
+            width = WidthForHeight(height);
+
+        // The NWindow holds at most 1920x1080; a width given with the height keeps its own aspect ratio (the
+        // Aspect Ratio option boxes the picture as for any window shape).
+        width = std::clamp(width + (width & 1), 640, 1920);
+        return { width, height };
+    }
+
+    // The docked and handheld sizes of resolution.txt (written with the defaults when missing).
+    void ReadResolutionFile(WindowSize& docked, WindowSize& handheld)
+    {
+        int dockedWidth = 0;
+        int dockedHeight = 0;
+        int handheldWidth = 0;
+        int handheldHeight = 0;
+
+        FILE* file = fopen(RESOLUTION_FILE, "r");
+        if (file == nullptr)
+        {
+            WriteDefaultResolutionFile();
+        }
+        else
+        {
+            char line[256];
+            while (fgets(line, sizeof(line), file) != nullptr)
+            {
+                // "key = value", case and spaces ignored; '#', ';' and "//" start a comment.
+                char text[256];
+                size_t length = 0;
+                for (const char* c = line; *c != '\0' && length + 1 < sizeof(text); c++)
+                {
+                    if (*c == '#' || *c == ';' || (c[0] == '/' && c[1] == '/'))
+                        break;
+
+                    if (!isspace(static_cast<unsigned char>(*c)))
+                        text[length++] = char(tolower(static_cast<unsigned char>(*c)));
+                }
+
+                text[length] = '\0';
+                char* equals = strchr(text, '=');
+                if (equals == nullptr)
+                    continue;
+
+                *equals = '\0';
+                int width = 0;
+                int height = 0;
+                ParseSize(equals + 1, width, height);
+                if (height <= 0)
+                    continue;
+
+                if (strcmp(text, "docked") == 0 || strcmp(text, "dock") == 0 || strcmp(text, "tv") == 0)
+                {
+                    dockedWidth = width;
+                    dockedHeight = height;
+                }
+                else if (strcmp(text, "handheld") == 0 || strcmp(text, "portable") == 0)
+                {
+                    handheldWidth = width;
+                    handheldHeight = height;
+                }
+            }
+
+            fclose(file);
+        }
+
+        docked = ClampWindowSize(dockedWidth, dockedHeight, DEFAULT_DOCKED_HEIGHT);
+        handheld = ClampWindowSize(handheldWidth, handheldHeight, DEFAULT_HANDHELD_HEIGHT);
+    }
+
+    bool g_startedDocked = false;
+    Event g_displayResolutionEvent{};
+    bool g_displayResolutionEventValid = false;
+    s32 g_lastDisplayHeight = 0; // the console's display height last seen (the change event need not clear itself)
+}
+#endif
 
 int Window_OnSDLEvent(void*, SDL_Event* event)
 {
@@ -166,10 +348,25 @@ void GameWindow::Init(const char* sdlVideoDriver)
 
     s_x = 0;
     s_y = 0;
-    s_width = DEFAULT_WIDTH;
-    s_height = DEFAULT_HEIGHT;
     s_isFocused = true;
     s_isFullscreenCursorVisible = false;
+
+    // The size of resolution.txt for the mode the console starts in (see above).
+    WindowSize dockedSize{};
+    WindowSize handheldSize{};
+    ReadResolutionFile(dockedSize, handheldSize);
+    g_startedDocked = QueryDocked();
+    const WindowSize size = g_startedDocked ? dockedSize : handheldSize;
+    s_width = size.width;
+    s_height = size.height;
+    fprintf(stderr, "Window: %dx%d (%s; resolution.txt: docked %dx%d, handheld %dx%d).\n", s_width, s_height,
+        g_startedDocked ? "docked" : "handheld", dockedSize.width, dockedSize.height, handheldSize.width, handheldSize.height);
+    g_displayResolutionEventValid = R_SUCCEEDED(appletGetDefaultDisplayResolutionChangeEvent(&g_displayResolutionEvent));
+    {
+        s32 displayWidth = 0;
+        if (R_FAILED(appletGetDefaultDisplayResolution(&displayWidth, &g_lastDisplayHeight)))
+            g_lastDisplayHeight = 0;
+    }
 
     s_renderWindow = nwindowGetDefault();
     if (s_renderWindow != nullptr)
@@ -265,6 +462,19 @@ void GameWindow::Init(const char* sdlVideoDriver)
 void GameWindow::Update()
 {
 #if defined(__SWITCH__)
+    // Docked or undocked while playing: the window keeps its size (see resolution.txt above); said once per change.
+    if (g_displayResolutionEventValid && R_SUCCEEDED(eventWait(&g_displayResolutionEvent, 0)))
+    {
+        s32 displayWidth = 0;
+        s32 displayHeight = 0;
+        if (R_SUCCEEDED(appletGetDefaultDisplayResolution(&displayWidth, &displayHeight)) && displayHeight != g_lastDisplayHeight)
+        {
+            g_lastDisplayHeight = displayHeight;
+            fprintf(stderr, "Window: the console now shows %dx%d (%s); the game keeps %dx%d until it is started again.\n",
+                int(displayWidth), int(displayHeight), displayHeight >= 1080 ? "docked" : "handheld", s_width, s_height);
+        }
+    }
+
     uint32_t nativeWidth = 0;
     uint32_t nativeHeight = 0;
     if (s_renderWindow != nullptr && nwindowGetDimensions(s_renderWindow, &nativeWidth, &nativeHeight) == 0)

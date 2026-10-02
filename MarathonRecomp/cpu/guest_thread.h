@@ -45,6 +45,12 @@ struct GuestThreadHandle : KernelObject
     #endif
     // HACK(1)
     std::atomic<bool> isFinished = false;
+#if defined(__SWITCH__)
+    // [Switch] SwitchThreadIdealCores: the thread's Horizon handle while it runs (0 before and after), and the core
+    // a SetThreadIdealProcessor call named before the thread could take it.
+    std::atomic<uint32_t> kernelHandle = 0;
+    std::atomic<int32_t> pendingIdealCore = -1;
+#endif
 
     GuestThreadHandle(const GuestThreadParams& params);
     ~GuestThreadHandle() override;

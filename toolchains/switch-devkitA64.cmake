@@ -9,8 +9,12 @@ set(MARATHON_RECOMP_SWITCH ON CACHE BOOL "Build for Nintendo Switch/libnx")
 set(PLUME_PLATFORM_SWITCH ON CACHE BOOL "Build Plume with Nintendo Switch/libnx Vulkan support")
 
 if(NOT DEFINED DEVKITPRO)
-  if(DEFINED ENV{DEVKITPRO})
+  # Git for Windows exports DEVKITPRO=/opt/devkitpro, which a native cmake sees as
+  # C:/Program Files/Git/opt/devkitpro: only take the environment when it exists.
+  if(DEFINED ENV{DEVKITPRO} AND EXISTS "$ENV{DEVKITPRO}")
     set(DEVKITPRO "$ENV{DEVKITPRO}" CACHE PATH "devkitPro root")
+  elseif(CMAKE_HOST_WIN32 AND NOT EXISTS "/opt/devkitpro" AND EXISTS "C:/devkitPro")
+    set(DEVKITPRO "C:/devkitPro" CACHE PATH "devkitPro root")
   else()
     set(DEVKITPRO "/opt/devkitpro" CACHE PATH "devkitPro root")
   endif()
@@ -48,6 +52,14 @@ set(CMAKE_CXX_FLAGS_INIT "-ffunction-sections -fdata-sections ${_SWITCH_ARCH_FLA
 # Rust runtime, so downstream links see duplicate symbols.
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-specs=${DEVKITPRO}/libnx/switch.specs -Wl,--gc-sections -Wl,--allow-multiple-definition")
 set(CMAKE_DL_LIBS "")
+
+# switch.specs finds switch.ld through the DEVKITPRO environment variable at link time, so a link started
+# by ninja from a shell whose DEVKITPRO is missing or in another form (Git Bash: /opt/devkitpro) failed.
+# Links run with the configured root instead.
+if(EXISTS "${DEVKITPRO}/libnx/switch.ld")
+  set(CMAKE_C_LINKER_LAUNCHER "${CMAKE_COMMAND};-E;env;DEVKITPRO=${DEVKITPRO}")
+  set(CMAKE_CXX_LINKER_LAUNCHER "${CMAKE_COMMAND};-E;env;DEVKITPRO=${DEVKITPRO}")
+endif()
 
 include_directories(SYSTEM
   "${_DEVKITA64}/include"

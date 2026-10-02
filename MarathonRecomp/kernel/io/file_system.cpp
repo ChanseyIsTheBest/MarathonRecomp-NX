@@ -11,6 +11,31 @@
 #include <user/paths.h>
 #include <stdafx.h>
 
+#if defined(__SWITCH__) && defined(__GLIBCXX__)
+#include <sys/stat.h>
+#define SWITCH_FEWER_FILE_QUERIES 1
+
+// [Switch] SwitchFewerFileQueries (set by SwitchPerfInitKernel before any guest code runs). XGetFileSizeA took the
+// size of an open file from its path (std::filesystem::file_size: a stat, which on the SD card is an entry-type
+// query, an open, a size query, a close and a time-stamp query, each a file-system IPC, two of them walking the
+// path), and the loader asks it for every file it reads whole. A read-only handle opened from its own path now
+// answers from its open descriptor (fstat: one size query). The same file, so the same size: the game has no way
+// to delete or rename a file (NtSetInformationFile is a stub), so while the handle is open its path names the file
+// it holds, and a write through another handle changes that same file. Anything else, or an fstat that fails,
+// takes the path as before.
+bool g_fewerFileQueries = false;
+
+// The descriptor under a libstdc++ filebuf: its __basic_file member is protected, and a pointer to it formed
+// through a derived class is the standard way to name it.
+struct FilebufDescriptor : std::filebuf
+{
+    static int Get(std::filebuf& buffer)
+    {
+        return (buffer.*(&FilebufDescriptor::_M_file)).fd();
+    }
+};
+#endif
+
 struct FileHandle : KernelObject
 {
     std::fstream stream;
@@ -20,6 +45,10 @@ struct FileHandle : KernelObject
     // seek+read on one handle corrupts the filebuf's internal pointers and makes
     // the underlying read write to a wild address. Serialize per handle.
     std::mutex mutex;
+#if defined(SWITCH_FEWER_FILE_QUERIES)
+    // The open descriptor of a read-only handle opened from `path` itself (SwitchFewerFileQueries), else -1.
+    int readOnlyFd = -1;
+#endif
 };
 
 struct FindHandle : KernelObject
@@ -115,6 +144,9 @@ FileHandle* XCreateFileA
     }
 
     fileStream.open(filePath, fileOpenMode);
+#if defined(SWITCH_FEWER_FILE_QUERIES)
+    const bool openedFromPath = fileStream.is_open();
+#endif
 
     if (!fileStream.is_open()) {
         std::filesystem::path cachedPath = FindInPathCache(filePath.string());
@@ -148,11 +180,39 @@ FileHandle* XCreateFileA
     FileHandle *fileHandle = CreateKernelObject<FileHandle>();
     fileHandle->stream = std::move(fileStream);
     fileHandle->path = std::move(filePath);
+#if defined(SWITCH_FEWER_FILE_QUERIES)
+    if (g_fewerFileQueries && openedFromPath && (dwDesiredAccess & GENERIC_WRITE) == 0)
+        fileHandle->readOnlyFd = FilebufDescriptor::Get(*fileHandle->stream.rdbuf());
+#endif
     return fileHandle;
 }
 
+#if defined(SWITCH_FEWER_FILE_QUERIES)
+// What std::filesystem::file_size(hFile->path) returns, from the open descriptor; false to take the path instead.
+static bool TryGetOpenFileSize(FileHandle* hFile, uint64_t& fileSize)
+{
+    struct stat st;
+    if (hFile->readOnlyFd < 0 || fstat(hFile->readOnlyFd, &st) != 0 || !S_ISREG(st.st_mode))
+        return false;
+
+    fileSize = uint64_t(st.st_size);
+    return true;
+}
+#endif
+
 static uint32_t XGetFileSizeA(FileHandle* hFile, be<uint32_t>* lpFileSizeHigh)
 {
+#if defined(SWITCH_FEWER_FILE_QUERIES)
+    uint64_t openFileSize;
+    if (TryGetOpenFileSize(hFile, openFileSize))
+    {
+        if (lpFileSizeHigh != nullptr)
+            *lpFileSizeHigh = uint32_t(openFileSize >> 32U);
+
+        return (uint32_t)(openFileSize);
+    }
+#endif
+
     std::error_code ec;
     auto fileSize = std::filesystem::file_size(hFile->path, ec);
     if (!ec)
@@ -170,6 +230,17 @@ static uint32_t XGetFileSizeA(FileHandle* hFile, be<uint32_t>* lpFileSizeHigh)
 
 uint32_t XGetFileSizeExA(FileHandle* hFile, LARGE_INTEGER* lpFileSize)
 {
+#if defined(SWITCH_FEWER_FILE_QUERIES)
+    uint64_t openFileSize;
+    if (TryGetOpenFileSize(hFile, openFileSize))
+    {
+        if (lpFileSize != nullptr)
+            lpFileSize->QuadPart = ByteSwap(openFileSize);
+
+        return TRUE;
+    }
+#endif
+
     std::error_code ec;
     auto fileSize = std::filesystem::file_size(hFile->path, ec);
     if (!ec)
@@ -373,6 +444,19 @@ uint32_t XReadFileEx(FileHandle* hFile, void* lpBuffer, uint32_t nNumberOfBytesT
 uint32_t XGetFileAttributesA(const char* lpFileName)
 {
     std::filesystem::path filePath = FileSystem::ResolvePath(lpFileName, true);
+#if defined(SWITCH_FEWER_FILE_QUERIES)
+    if (g_fewerFileQueries)
+    {
+        // One stat for both questions: is_directory(path) and is_regular_file(path) are each a status(path).
+        const std::filesystem::file_status status = std::filesystem::status(filePath);
+        if (std::filesystem::is_directory(status))
+            return FILE_ATTRIBUTE_DIRECTORY;
+        else if (std::filesystem::is_regular_file(status))
+            return FILE_ATTRIBUTE_NORMAL;
+        else
+            return INVALID_FILE_ATTRIBUTES;
+    }
+#endif
     if (std::filesystem::is_directory(filePath))
         return FILE_ATTRIBUTE_DIRECTORY;
     else if (std::filesystem::is_regular_file(filePath))

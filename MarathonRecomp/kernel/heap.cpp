@@ -1,4 +1,5 @@
 #include <stdafx.h>
+#include <bit>
 #include <cstdint>
 #include "heap.h"
 #include "memory.h"
@@ -28,23 +29,40 @@ size_t AlignUp(size_t value, size_t alignment)
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+// The fragment o1heap takes for an allocation: the smallest power of two that holds it and its header. One
+// instruction (count leading zeros) instead of a doubling loop of up to ~30 iterations inside the heap lock; the
+// same value for every size (std::bit_ceil is the smallest power of two >= its argument, and the argument is >= 1).
 size_t RoundHeapFragmentSize(size_t size)
 {
-    size = std::max<size_t>(1, size) + O1HEAP_ALIGNMENT;
-
-    size_t rounded = 1;
-    while (rounded < size)
-        rounded <<= 1;
-
-    return rounded;
+    return std::bit_ceil(std::max<size_t>(1, size) + O1HEAP_ALIGNMENT);
 }
+
+// [Switch] Commits end on absolute 16 MB boundaries of the guest window (not 16 MB past the range's start, which is
+// 0x20000 for the user heap), and a commit that starts off a 2 MB boundary is split there: every later commit then
+// starts 2 MB-aligned, which lets MapSwitchProcessMemoryRange take 2 MB-aligned backing and code memory, so the kernel
+// can map the game's heap with 2 MB blocks instead of 4 KB pages (TLB reach; the perf5 profile's hot lines include many
+// first loads of heap objects). The same guest addresses are committed, zero-filled, at the same allocations; only how
+// the pages are grouped into commits changes.
+constexpr size_t SWITCH_MAP_BLOCK_SIZE = 2 * 1024 * 1024;
 
 bool EnsureCommittedPrefix(size_t rangeStart, size_t rangeSize, size_t& committedPrefix, size_t requestedPrefix)
 {
-    requestedPrefix = std::min(rangeSize, AlignUp(requestedPrefix, SWITCH_HEAP_COMMIT_GRANULARITY));
+    const size_t requestedEnd = AlignUp(rangeStart + std::min(rangeSize, requestedPrefix), SWITCH_HEAP_COMMIT_GRANULARITY);
+    requestedPrefix = std::min(rangeSize, requestedEnd - rangeStart);
 
     if (requestedPrefix <= committedPrefix)
         return true;
+
+    const size_t from = rangeStart + committedPrefix;
+    const size_t to = rangeStart + requestedPrefix;
+    const size_t boundary = AlignUp(from, SWITCH_MAP_BLOCK_SIZE);
+    if (from < boundary && boundary < to)
+    {
+        if (!g_memory.CommitRange(from, boundary - from))
+            return false;
+
+        committedPrefix = boundary - rangeStart;
+    }
 
     if (!g_memory.CommitRange(rangeStart + committedPrefix, requestedPrefix - committedPrefix))
         return false;
@@ -105,13 +123,15 @@ void Heap::Init()
 void* Heap::Alloc(size_t size)
 {
     size = std::max<size_t>(1, size);
+#if defined(__SWITCH__)
+    const size_t fragmentSize = RoundHeapFragmentSize(size); // Depends on the size alone: outside the lock.
+#endif
 
     std::lock_guard lock(mutex);
     if (heap == nullptr)
         return nullptr;
 
 #if defined(__SWITCH__)
-    const size_t fragmentSize = RoundHeapFragmentSize(size);
     if (!PreCommitForAllocation(USER_HEAP_BEGIN, USER_HEAP_SIZE, committedHeapPrefix, touchedHeapPrefix, fragmentSize))
     {
         LOGFN_ERROR("Switch user heap commit failed: size={}, fragment={}, frontier={}, committed={}", size, fragmentSize, touchedHeapPrefix, committedHeapPrefix);
@@ -136,13 +156,15 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
     size = std::max<size_t>(1, size);
     alignment = alignment == 0 ? 0x1000 : std::max<size_t>(16, alignment);
     const size_t allocationSize = size + alignment;
+#if defined(__SWITCH__)
+    const size_t fragmentSize = RoundHeapFragmentSize(allocationSize); // Depends on the size alone: outside the lock.
+#endif
 
     std::lock_guard lock(physicalMutex);
     if (physicalHeap == nullptr)
         return nullptr;
 
 #if defined(__SWITCH__)
-    const size_t fragmentSize = RoundHeapFragmentSize(allocationSize);
     if (!PreCommitForAllocation(RESERVED_END, PHYSICAL_HEAP_SIZE, committedPhysicalHeapPrefix, touchedPhysicalHeapPrefix, fragmentSize))
     {
         LOGFN_ERROR("Switch physical heap commit failed: size={}, fragment={}, frontier={}, committed={}", size, fragmentSize, touchedPhysicalHeapPrefix, committedPhysicalHeapPrefix);

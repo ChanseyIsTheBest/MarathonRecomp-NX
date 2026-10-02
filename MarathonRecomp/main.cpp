@@ -30,6 +30,10 @@
 #include <preload_executable.h>
 #include <iostream>
 #include <app.h>
+#if defined(__SWITCH__)
+#include <os/switch_cpu_profiler.h>
+#include <os/switch_perf_init.h>
+#endif
 
 #ifdef _WIN32
 #include <timeapi.h>
@@ -256,6 +260,10 @@ int main(int argc, char *argv[])
 
     Config::Load();
 
+#if defined(__SWITCH__)
+    SwitchPerfOnConfigLoaded();
+#endif
+
     if (forceInstallationCheck)
     {
         // Create the console to show progress to the user, otherwise it will seem as if the game didn't boot at all.
@@ -378,6 +386,11 @@ int main(int argc, char *argv[])
         }
     }
     // Video::StartPipelinePrecompilation();
+
+#if defined(__SWITCH__)
+    // [Switch] From here on this thread runs the game's main thread: named by its entry point, like the guest threads.
+    os::switch_cpu_profiler::RegisterCurrentThreadWithAddress("main", entry);
+#endif
 
     GuestThread::Start({ entry, 0, 0 });
 

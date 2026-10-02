@@ -1,0 +1,1422 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index f8f5223..aee65e7 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -15,6 +15,41 @@ bool Recompiler::LoadConfig(const std::string_view& configFilePath)
+ {
+     config.Load(configFilePath);
+ 
++    // [Switch] The code generation before the Switch performance work, for A/B builds (see recompiler.h).
++    if (const char* classic = std::getenv("XENON_RECOMP_CLASSIC"); classic != nullptr && classic[0] == '1')
++    {
++        loopBarriers = false;
++        skipCalleeSaves = false;
++        csrAcrossLabels = false;
++        explicitFma = false;
++        fmt::println("XENON_RECOMP_CLASSIC=1: no loop barriers, callee-saved stores kept, CSR state unknown at labels, "
++            "fused multiply-adds as plain expressions");
++    }
++
++    // [Switch] Fewer FPCR mode switches (see recompiler.h).
++    if (const char* fewer = std::getenv("XENON_RECOMP_FEWER_MODE_SWITCHES"); fewer != nullptr && fewer[0] == '1')
++    {
++        fewerModeSwitches = 1;
++        fmt::println("XENON_RECOMP_FEWER_MODE_SWITCHES=1: instructions whose result does not depend on the flush mode keep "
++            "the known one");
++    }
++
++    // [Switch] Opt-in A/B (Marathon keeps every register in PPCContext): the condition registers, CTR, XER and
++    // the reservation as locals of each function, and no LR/MSR bookkeeping. Only these: the recompiled game
++    // reads none of them before writing it, nor after a call without writing it again, apart from code that
++    // never runs (exception funclets, the guest setjmp/longjmp bodies). The non-volatile and non-argument
++    // registers stay in PPCContext: exception funclets and split functions read the caller's r12/r14-r31.
++    if (const char* locals = std::getenv("XENON_RECOMP_REGISTER_LOCALS"); locals != nullptr && locals[0] == '1')
++    {
++        config.crRegistersAsLocalVariables = true;
++        config.ctrAsLocalVariable = true;
++        config.xerAsLocalVariable = true;
++        config.reservedRegisterAsLocalVariable = true;
++        config.skipLr = true;
++        config.skipMsr = true;
++        fmt::println("XENON_RECOMP_REGISTER_LOCALS=1: CR, CTR, XER and the reservation as locals, no LR/MSR");
++    }
++
+     std::vector<uint8_t> file;
+     if (!config.patchedFilePath.empty())
+         file = LoadFile((config.directoryPath + config.patchedFilePath).c_str());
+@@ -403,11 +438,54 @@ bool Recompiler::Recompile(
+             }
+         };
+ 
++    // A call in tail position (nothing but branches and blr after it) may become a jump once the
++    // compiler inlines direct calls: a self call, even through inlined callees, turns into a loop by
++    // tail-recursion elimination. The barrier before it keeps such a loop reading guest memory again
++    // on every pass, as the loop barriers do; before an ordinary call it costs nothing, since the call
++    // already makes the compiler forget guest memory.
++    auto printTailCallBarrier = [&](std::string_view prefix)
++        {
++            if (loopBarriers)
++                println("{}PPC_LOOP_BARRIER();", prefix);
++        };
++
++    auto isTailPosition = [&](uint32_t address)
++        {
++            for (size_t steps = 0; steps < 16 && address >= fn.base && address < fn.base + fn.size; steps++)
++            {
++                if (config.midAsmHooks.find(address) != config.midAsmHooks.end())
++                    return false;
++
++                const uint32_t instruction = ByteSwap(*reinterpret_cast<const uint32_t*>(image.Find(address)));
++                if (instruction == 0x4E800020) // blr
++                    return true;
++                if (instruction == 0x60000000) // nop
++                    address += 4;
++                else if (PPC_OP(instruction) == PPC_OP_B && !PPC_BL(instruction) && (instruction & 2) == 0) // b
++                    address += PPC_BI(instruction);
++                else
++                    return false;
++            }
++            return false;
++        };
++
++    // A branch to a label of this function: records the flush mode it carries there, and on a backward
++    // branch (a loop) makes the compiler read guest memory again on the next pass.
++    auto printGoto = [&](std::string_view prefix, uint32_t target)
++        {
++            RecordCsrEdge(target, csrState);
++            if (loopBarriers && target <= base)
++                println("{}{{ PPC_LOOP_BARRIER(); goto loc_{:X}; }}", prefix, target);
++            else
++                println("{}goto loc_{:X};", prefix, target);
++        };
++
+     auto printConditionalBranch = [&](bool not_, const std::string_view& cond)
+         {
+             if (insn.operands[1] < fn.base || insn.operands[1] >= fn.base + fn.size)
+             {
+                 println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
++                printTailCallBarrier("\t\t");
+                 print("\t");
+                 printFunctionCall(insn.operands[1]);
+                 println("\t\treturn;");
+@@ -415,7 +493,7 @@ bool Recompiler::Recompile(
+             }
+             else
+             {
+-                println("\tif ({}{}.{}) goto loc_{:X};", not_ ? "!" : "", cr(insn.operands[0]), cond, insn.operands[1]);
++                printGoto(fmt::format("\tif ({}{}.{}) ", not_ ? "!" : "", cr(insn.operands[0]), cond), insn.operands[1]);
+             }
+         };
+ 
+@@ -432,6 +510,26 @@ bool Recompiler::Recompile(
+             }
+         };
+ 
++    // [Switch] fewerModeSwitches: true when the instruction can run in the VMX flush mode, which is then kept.
++    auto keepsVmxMode = [&]()
++        {
++            return fewerModeSwitches >= 1 && csrState == CSRState::VMX;
++        };
++
++    // An instruction whose result is the same in either mode: it sets the FPU mode only where it always did.
++    auto printSetFlushModeUnlessVmx = [&]()
++        {
++            if (!keepsVmxMode())
++                printSetFlushMode(false);
++        };
++
++    // The same for a vector instruction in the FPU mode: it sets the VMX mode only where it always did.
++    auto printSetFlushModeUnlessFpu = [&]()
++        {
++            if (!(fewerModeSwitches >= 1 && csrState == CSRState::FPU))
++                printSetFlushMode(true);
++        };
++
+     auto midAsmHook = config.midAsmHooks.find(base);
+ 
+     auto printMidAsmHook = [&]()
+@@ -486,10 +584,14 @@ bool Recompiler::Recompile(
+             {
+                 println(")) {{");
+ 
++                // The hook is host code that may call guest code: the flush mode is unknown after it.
++                if (csrAcrossLabels)
++                    csrState = CSRState::Unknown;
++
+                 if (midAsmHook->second.returnOnTrue)
+                     println("\t\treturn;");
+                 else if (midAsmHook->second.jumpAddressOnTrue != NULL)
+-                    println("\t\tgoto loc_{:X};", midAsmHook->second.jumpAddressOnTrue);
++                    printGoto("\t\t", midAsmHook->second.jumpAddressOnTrue);
+ 
+                 println("\t}}");
+ 
+@@ -498,7 +600,7 @@ bool Recompiler::Recompile(
+                 if (midAsmHook->second.returnOnFalse)
+                     println("\t\treturn;");
+                 else if (midAsmHook->second.jumpAddressOnFalse != NULL)
+-                    println("\t\tgoto loc_{:X};", midAsmHook->second.jumpAddressOnFalse);
++                    printGoto("\t\t", midAsmHook->second.jumpAddressOnFalse);
+ 
+                 println("\t}}");
+             }
+@@ -506,10 +608,13 @@ bool Recompiler::Recompile(
+             {
+                 println(");");
+ 
++                if (csrAcrossLabels)
++                    csrState = CSRState::Unknown;
++
+                 if (midAsmHook->second.ret)
+                     println("\treturn;");
+                 else if (midAsmHook->second.jumpAddress != NULL)
+-                    println("\tgoto loc_{:X};", midAsmHook->second.jumpAddress);
++                    printGoto("\t", midAsmHook->second.jumpAddress);
+             }
+         };
+ 
+@@ -596,18 +701,31 @@ bool Recompiler::Recompile(
+     case PPC_INST_B:
+         if (insn.operands[0] < fn.base || insn.operands[0] >= fn.base + fn.size)
+         {
++            printTailCallBarrier("\t");
+             printFunctionCall(insn.operands[0]);
+             println("\treturn;");
+         }
+         else
+         {
+-            println("\tgoto loc_{:X};", insn.operands[0]);
++            printGoto("\t", insn.operands[0]);
+         }
+         break;
+ 
+     case PPC_INST_BCTR:
+         if (switchTable != config.switchTables.end())
+         {
++            if (loopBarriers)
++            {
++                for (auto label : switchTable->second.labels)
++                {
++                    if (label <= base && label >= fn.base)
++                    {
++                        println("\tPPC_LOOP_BARRIER();");
++                        break;
++                    }
++                }
++            }
++
+             println("\tswitch ({}.u64) {{", r(switchTable->second.r));
+ 
+             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
+@@ -617,11 +735,13 @@ bool Recompiler::Recompile(
+                 if (label < fn.base || label >= fn.base + fn.size)
+                 {
+                     println("\t\t// ERROR: 0x{:X}", label);
+-                    fmt::println("ERROR: Switch case at {:X} is trying to jump outside function: {:X}", base, label);
++                    if (!quiet)
++                        fmt::println("ERROR: Switch case at {:X} is trying to jump outside function: {:X}", base, label);
+                     println("\t\treturn;");
+                 }
+                 else
+                 {
++                    RecordCsrEdge(label, csrState);
+                     println("\t\tgoto loc_{:X};", label);
+                 }
+             }
+@@ -648,7 +768,7 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_BDZ:
+         println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 == 0) goto loc_{:X};", ctr(), insn.operands[0]);
++        printGoto(fmt::format("\tif ({}.u32 == 0) ", ctr()), insn.operands[0]);
+         break;
+ 
+     case PPC_INST_BDZLR:
+@@ -658,13 +778,13 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_BDNZ:
+         println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 != 0) goto loc_{:X};", ctr(), insn.operands[0]);
++        printGoto(fmt::format("\tif ({}.u32 != 0) ", ctr()), insn.operands[0]);
+         break;
+ 
+     case PPC_INST_BDNZF:
+         // NOTE: assuming eq here as a shortcut because all the instructions in the game do that
+         println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 != 0 && !{}.eq) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), insn.operands[1]);
++        printGoto(fmt::format("\tif ({}.u32 != 0 && !{}.eq) ", ctr(), cr(insn.operands[0] / 4)), insn.operands[1]);
+         break;
+ 
+     case PPC_INST_BEQ:
+@@ -694,6 +814,8 @@ bool Recompiler::Recompile(
+     case PPC_INST_BL:
+         if (!config.skipLr)
+             println("\tctx.lr = 0x{:X};", base + 4);
++        if (isTailPosition(base + 4))
++            printTailCallBarrier("\t");
+         printFunctionCall(insn.operands[0]);
+         csrState = CSRState::Unknown; // the call could change it
+         break;
+@@ -804,11 +926,13 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_DCBT:
+-        // no op
+-        break;
+-
+     case PPC_INST_DCBTST:
+-        // no op
++        // [Switch] A host prefetch of the same address (PPC_PREFETCH, ppc_context.h); it changes nothing else.
++        // The operands are CT (the touch hint), RA (0: none) and RB.
++        print("\t{}(", insn.opcode->id == PPC_INST_DCBT ? "PPC_PREFETCH" : "PPC_PREFETCH_STORE");
++        if (insn.operands[1] != 0)
++            print("{}.u32 + ", r(insn.operands[1]));
++        println("{}.u32);", r(insn.operands[2]));
+         break;
+ 
+     case PPC_INST_DCBZ:
+@@ -848,7 +972,8 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_EIEIO:
+-        // no op
++        // Store-ordering barrier (the guest uses it to publish data before a flag, and before MMIO stores).
++        println("\tPPC_LWSYNC();");
+         break;
+ 
+     case PPC_INST_EXTSB:
+@@ -870,7 +995,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_FABS:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         println("\t{}.u64 = {}.u64 & ~0x8000000000000000;", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
+@@ -885,11 +1010,16 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_FCFID:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         println("\t{}.f64 = double({}.s64);", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_FCMPU:
++        if (keepsVmxMode())
++        {
++            println("\t{}.compareBits({}.u64, {}.u64);", cr(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]));
++            break;
++        }
+         printSetFlushMode(false);
+         println("\t{}.compare({}.f64, {}.f64);", cr(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]));
+         break;
+@@ -900,12 +1030,12 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_FCTIDZ:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         println("\t{}.s64 = ({}.f64 > double(LLONG_MAX)) ? LLONG_MAX : simde_mm_cvttsd_si64(simde_mm_load_sd(&{}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_FCTIWZ:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         println("\t{}.s64 = ({}.f64 > double(INT_MAX)) ? INT_MAX : simde_mm_cvttsd_si32(simde_mm_load_sd(&{}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[1]));
+         break;
+ 
+@@ -921,27 +1051,39 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_FMADD:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = {}.f64 * {}.f64 + {}.f64;", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = PPC_FMA({}.f64, {}.f64, {}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = {}.f64 * {}.f64 + {}.f64;", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FMADDS:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = double(float({}.f64 * {}.f64 + {}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = double(float(PPC_FMA({}.f64, {}.f64, {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = double(float({}.f64 * {}.f64 + {}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FMR:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         println("\t{}.f64 = {}.f64;", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_FMSUB:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = {}.f64 * {}.f64 - {}.f64;", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = PPC_FMS({}.f64, {}.f64, {}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = {}.f64 * {}.f64 - {}.f64;", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FMSUBS:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = double(float({}.f64 * {}.f64 - {}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = double(float(PPC_FMS({}.f64, {}.f64, {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = double(float({}.f64 * {}.f64 - {}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FMUL:
+@@ -955,28 +1097,37 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_FNABS:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         println("\t{}.u64 = {}.u64 | 0x8000000000000000;", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_FNEG:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         println("\t{}.u64 = {}.u64 ^ 0x8000000000000000;", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_FNMADDS:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = double(float(-({}.f64 * {}.f64 + {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = double(float(-PPC_FMA({}.f64, {}.f64, {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = double(float(-({}.f64 * {}.f64 + {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FNMSUB:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = -({}.f64 * {}.f64 - {}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = -PPC_FMS({}.f64, {}.f64, {}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = -({}.f64 * {}.f64 - {}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FNMSUBS:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = double(float(-({}.f64 * {}.f64 - {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = double(float(-PPC_FMS({}.f64, {}.f64, {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = double(float(-({}.f64 * {}.f64 - {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FRES:
+@@ -985,6 +1136,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_FRSP:
++        // Not with fewerModeSwitches, as lfs: its result must stay a double(float) for GCC.
+         printSetFlushMode(false);
+         println("\t{}.f64 = double(float({}.f64));", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+@@ -1063,7 +1215,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LFD:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         print("\t{}.u64 = PPC_LOAD_U64(", f(insn.operands[0]));
+         if (insn.operands[2] != 0)
+             print("{}.u32 + ", r(insn.operands[2]));
+@@ -1071,7 +1223,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LFDX:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         print("\t{}.u64 = PPC_LOAD_U64(", f(insn.operands[0]));
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+@@ -1079,6 +1231,9 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LFS:
++        // Not with fewerModeSwitches: GCC knows double(float) is a float, narrows single-precision products and
++        // sums of such values to float arithmetic and may fuse them; PPCFloatToDoubleAnyMode would hide that and
++        // change those choices (7 functions in the perf5 check), so the loads keep the FPU mode.
+         printSetFlushMode(false);
+         print("\t{}.u32 = PPC_LOAD_U32(", temp());
+         if (insn.operands[2] != 0)
+@@ -1088,6 +1243,9 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LFSX:
++        // Not with fewerModeSwitches: GCC knows double(float) is a float, narrows single-precision products and
++        // sums of such values to float arithmetic and may fuse them; PPCFloatToDoubleAnyMode would hide that and
++        // change those choices (7 functions in the perf5 check), so the loads keep the FPU mode.
+         printSetFlushMode(false);
+         print("\t{}.u32 = PPC_LOAD_U32(", temp());
+         if (insn.operands[1] != 0)
+@@ -1216,7 +1374,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LWSYNC:
+-        // no op
++        println("\tPPC_LWSYNC();");
+         break;
+ 
+     case PPC_INST_LWZ:
+@@ -1510,10 +1668,10 @@ bool Recompiler::Recompile(
+     case PPC_INST_STDCX:
+         println("\t{}.lt = 0;", cr(0));
+         println("\t{}.gt = 0;", cr(0));
+-        print("\t{}.eq = __sync_bool_compare_and_swap(reinterpret_cast<uint64_t*>(base + ", cr(0));
++        print("\t{}.eq = PPCStoreConditional64(reinterpret_cast<uint64_t*>(base + ", cr(0));
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+-        println("{}.u32), {}.s64, __builtin_bswap64({}.s64));", r(insn.operands[2]), reserved(), r(insn.operands[0]));
++        println("{}.u32), {}.u64, __builtin_bswap64({}.u64));", r(insn.operands[2]), reserved(), r(insn.operands[0]));
+         println("\t{}.so = {}.so;", cr(0), xer());
+         break;
+ 
+@@ -1531,7 +1689,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_STFD:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         print("{}", mmioStore() ? "\tPPC_MM_STORE_U64(" : "\tPPC_STORE_U64(");
+         if (insn.operands[2] != 0)
+             print("{}.u32 + ", r(insn.operands[2]));
+@@ -1539,7 +1697,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_STFDX:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         print("{}", mmioStore() ? "\tPPC_MM_STORE_U64(" : "\tPPC_STORE_U64(");
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+@@ -1547,7 +1705,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_STFIWX:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         print("{}", mmioStore() ? "\tPPC_MM_STORE_U32(" : "\tPPC_STORE_U32(");
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+@@ -1555,8 +1713,13 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_STFS:
+-        printSetFlushMode(false);
+-        println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        if (keepsVmxMode())
++            println("\t{}.u32 = PPCDoubleToFloatBitsAnyMode({}.u64, ctx.fpscr.csr);", temp(), f(insn.operands[0]));
++        else
++        {
++            printSetFlushMode(false);
++            println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        }
+         print("{}", mmioStore() ? "\tPPC_MM_STORE_U32(" : "\tPPC_STORE_U32(");
+         if (insn.operands[2] != 0)
+             print("{}.u32 + ", r(insn.operands[2]));
+@@ -1564,8 +1727,13 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_STFSX:
+-        printSetFlushMode(false);
+-        println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        if (keepsVmxMode())
++            println("\t{}.u32 = PPCDoubleToFloatBitsAnyMode({}.u64, ctx.fpscr.csr);", temp(), f(insn.operands[0]));
++        else
++        {
++            printSetFlushMode(false);
++            println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        }
+         print("{}", mmioStore() ? "\tPPC_MM_STORE_U32(" : "\tPPC_STORE_U32(");
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+@@ -1665,10 +1833,10 @@ bool Recompiler::Recompile(
+     case PPC_INST_STWCX:
+         println("\t{}.lt = 0;", cr(0));
+         println("\t{}.gt = 0;", cr(0));
+-        print("\t{}.eq = __sync_bool_compare_and_swap(reinterpret_cast<uint32_t*>(base + ", cr(0));
++        print("\t{}.eq = PPCStoreConditional32(reinterpret_cast<uint32_t*>(base + ", cr(0));
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+-        println("{}.u32), {}.s32, __builtin_bswap32({}.s32));", r(insn.operands[2]), reserved(), r(insn.operands[0]));
++        println("{}.u32), {}.u32, __builtin_bswap32({}.u32));", r(insn.operands[2]), reserved(), r(insn.operands[0]));
+         println("\t{}.so = {}.so;", cr(0), xer());
+         break;
+ 
+@@ -1718,7 +1886,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_SYNC:
+-        // no op
++        println("\tPPC_SYNC();");
+         break;
+ 
+     case PPC_INST_TDLGEI:
+@@ -1796,7 +1964,8 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_VCTSXS:
+     case PPC_INST_VCFPSXWS128:
+-        printSetFlushMode(true);
++        // A denormal (times at most 2^31) truncates to 0 whether or not FZ makes it a zero first.
++        printSetFlushModeUnlessFpu();
+         print("\tsimde_mm_store_si128((simde__m128i*){}.s32, simde_mm_vctsxs(", v(insn.operands[0]));
+         if (insn.operands[2] != 0)
+             println("simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_set1_ps({}))));", v(insn.operands[1]), 1u << insn.operands[2]);
+@@ -1807,7 +1976,8 @@ bool Recompiler::Recompile(
+     case PPC_INST_VCFSX:
+     case PPC_INST_VCSXWFP128:
+     {
+-        printSetFlushMode(true);
++        // An integer as a float is 0 or at least 1 in magnitude, and at least 2^-31 after the scale: never a denormal.
++        printSetFlushModeUnlessFpu();
+         print("\tsimde_mm_store_ps({}.f32, ", v(insn.operands[0]));
+         if (insn.operands[2] != 0)
+         {
+@@ -1824,7 +1994,7 @@ bool Recompiler::Recompile(
+     case PPC_INST_VCFUX:
+     case PPC_INST_VCUXWFP128:
+     {
+-        printSetFlushMode(true);
++        printSetFlushModeUnlessFpu();
+         print("\tsimde_mm_store_ps({}.f32, ", v(insn.operands[0]));
+         if (insn.operands[2] != 0)
+         {
+@@ -1910,7 +2080,10 @@ bool Recompiler::Recompile(
+     case PPC_INST_VMADDFP:
+     case PPC_INST_VMADDFP128:
+         printSetFlushMode(true);
+-        println("\tsimde_mm_store_ps({}.f32, simde_mm_add_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
++        if (explicitFma)
++            println("\tsimde_mm_store_ps({}.f32, simde_mm_vmaddfp(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
++        else
++            println("\tsimde_mm_store_ps({}.f32, simde_mm_add_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_VMAXFP:
+@@ -1974,7 +2147,10 @@ bool Recompiler::Recompile(
+     case PPC_INST_VNMSUBFP:
+     case PPC_INST_VNMSUBFP128:
+         printSetFlushMode(true);
+-        println("\tsimde_mm_store_ps({}.f32, simde_mm_xor_ps(simde_mm_sub_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
++        if (explicitFma)
++            println("\tsimde_mm_store_ps({}.f32, simde_mm_vnmsubfp(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
++        else
++            println("\tsimde_mm_store_ps({}.f32, simde_mm_xor_ps(simde_mm_sub_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_VOR:
+@@ -2012,7 +2188,7 @@ bool Recompiler::Recompile(
+         switch (insn.operands[2])
+         {
+         case 0: // D3D color
+-            if (insn.operands[3] != 1 || insn.operands[4] != 3)
++            if ((insn.operands[3] != 1 || insn.operands[4] != 3) && !quiet)
+                 fmt::println("Unexpected D3D color pack instruction at {:X}", base);
+ 
+             for (size_t i = 0; i < 4; i++)
+@@ -2051,13 +2227,14 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_VRFIN:
+     case PPC_INST_VRFIN128:
+-        printSetFlushMode(true);
++        // A denormal rounds to the zero of its sign in either mode (FZ gives that zero first).
++        printSetFlushModeUnlessFpu();
+         println("\tsimde_mm_store_ps({}.f32, simde_mm_round_ps(simde_mm_load_ps({}.f32), SIMDE_MM_FROUND_TO_NEAREST_INT | SIMDE_MM_FROUND_NO_EXC));", v(insn.operands[0]), v(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_VRFIZ:
+     case PPC_INST_VRFIZ128:
+-        printSetFlushMode(true);
++        printSetFlushModeUnlessFpu();
+         println("\tsimde_mm_store_ps({}.f32, simde_mm_round_ps(simde_mm_load_ps({}.f32), SIMDE_MM_FROUND_TO_ZERO | SIMDE_MM_FROUND_NO_EXC));", v(insn.operands[0]), v(insn.operands[1]));
+         break;
+ 
+@@ -2424,7 +2601,7 @@ bool Recompiler::Recompile(
+     if (strchr(insn.opcode->name, '.'))
+     {
+         int lastLine = out.find_last_of('\n', out.size() - 2);
+-        if (out.find("cr0", lastLine + 1) == std::string::npos && out.find("cr6", lastLine + 1) == std::string::npos)
++        if (out.find("cr0", lastLine + 1) == std::string::npos && out.find("cr6", lastLine + 1) == std::string::npos && !quiet)
+             fmt::println("{} at {:X} has RC bit enabled but no comparison was generated", insn.opcode->name, base);
+     }
+ #endif
+@@ -2435,6 +2612,13 @@ bool Recompiler::Recompile(
+     return true;
+ }
+ 
++void Recompiler::RecordCsrEdge(uint32_t target, CSRState state)
++{
++    auto [edge, inserted] = csrLabelEdges.emplace(target, state);
++    if (!inserted && edge->second != state)
++        edge->second = CSRState::Unknown;
++}
++
+ bool Recompiler::Recompile(const Function& fn)
+ {
+     auto base = fn.base;
+@@ -2541,9 +2725,74 @@ bool Recompiler::Recompile(const Function& fn)
+     println("PPC_FUNC_IMPL(__imp__{}) {{", name);
+     println("\tPPC_FUNC_PROLOGUE();");
+ 
+-    auto switchTable = config.switchTables.end();
+-    bool allRecompiled = true;
+-    CSRState csrState = CSRState::Unknown;
++    // [Switch] skipCalleeSaves. With non-volatile registers as locals, the stores of callee-saved
++    // registers (and of the link register) that open a function write this function's own, fresh
++    // locals: the caller's registers are the caller's locals, and the restores in the epilogues load
++    // them back into locals that are dead. Nothing can read what these stores wrote. Only the run of
++    // stores at the very start, before the frame is allocated (stwu) and before any label or hook,
++    // counts; a store after any other instruction may be a real spill. Inactive while Marathon.toml
++    // keeps non_volatile_as_local = false (the stores then save the caller's live ctx registers).
++    skippedSaves.clear();
++    if (skipCalleeSaves && config.nonVolatileRegistersAsLocalVariables)
++    {
++        enum class R12 { Unknown, LinkRegister, Offset, StackAddress } r12 = R12::Unknown;
++        const uint32_t* scan = data;
++        ppc_insn scanInsn;
++        for (uint32_t address = fn.base; address < end; address += 4, ++scan)
++        {
++            if ((address != fn.base && labels.find(address) != labels.end()) ||
++                config.midAsmHooks.find(address) != config.midAsmHooks.end())
++            {
++                break;
++            }
++
++            ppc::Disassemble(scan, 4, address, scanInsn);
++            if (scanInsn.opcode == nullptr)
++                break;
++
++            const auto id = scanInsn.opcode->id;
++            const auto* op = scanInsn.operands;
++            const bool nonVolatileVmx = (op[0] >= 14 && op[0] <= 31) || (op[0] >= 64 && op[0] <= 127);
++
++            if (id == PPC_INST_MFLR && op[0] == 12)
++            {
++                r12 = R12::LinkRegister;
++            }
++            else if (id == PPC_INST_LI && op[0] == 12 && int32_t(op[1]) < 0)
++            {
++                r12 = R12::Offset;
++            }
++            else if (id == PPC_INST_ADDI && op[0] == 12 && op[1] == 1 && int32_t(op[2]) < 0)
++            {
++                r12 = R12::StackAddress;
++            }
++            else if (id == PPC_INST_STW && op[0] == 12 && op[2] == 1 && int32_t(op[1]) < 0 && r12 == R12::LinkRegister)
++            {
++                skippedSaves.emplace(address);
++            }
++            else if ((id == PPC_INST_STD || id == PPC_INST_STW || id == PPC_INST_STFD) && op[0] >= 14 && op[0] <= 31 &&
++                op[2] == 1 && int32_t(op[1]) < 0)
++            {
++                skippedSaves.emplace(address);
++            }
++            else if ((id == PPC_INST_STVX || id == PPC_INST_STVX128) && nonVolatileVmx && op[2] == 12 &&
++                ((op[1] == 1 && r12 == R12::Offset) || (op[1] == 0 && r12 == R12::StackAddress)))
++            {
++                skippedSaves.emplace(address);
++            }
++            else if (id == PPC_INST_BL)
++            {
++                // The save helpers (__savegprlr_N, __savefpr_N, __savevmx_N) print nothing already.
++                auto target = image.symbols.find(op[0]);
++                if (target == image.symbols.end() || target->address != op[0] || target->name.find("__save") != 0)
++                    break;
++            }
++            else
++            {
++                break;
++            }
++        }
++    }
+ 
+     // TODO: the printing scheme here is scuffed
+     RecompilerLocalVariables localVariables;
+@@ -2551,45 +2800,121 @@ bool Recompiler::Recompile(const Function& fn)
+     tempString.clear();
+     std::swap(out, tempString);
+ 
+-    ppc_insn insn;
+-    while (base < end)
+-    {
+-        if (labels.find(base) != labels.end())
++    const uint32_t* const bodyData = data;
++    auto printBody = [&]() -> bool
+         {
+-            println("loc_{:X}:", base);
++            uint32_t base = fn.base;
++            const uint32_t* data = bodyData;
++            auto switchTable = config.switchTables.end();
++            bool allRecompiled = true;
++            CSRState csrState = CSRState::Unknown;
++            bool fallsThrough = true;
++
++            // Callers leave the flush mode unknown.
++            if (labels.find(fn.base) != labels.end())
++                RecordCsrEdge(fn.base, CSRState::Unknown);
++
++            ppc_insn insn;
++            while (base < end)
++            {
++                if (labels.find(base) != labels.end())
++                {
++                    println("loc_{:X}:", base);
+ 
+-            // Anyone could jump to this label so we wouldn't know what the CSR state would be.
+-            csrState = CSRState::Unknown;
+-        }
++                    if (base != fn.base && fallsThrough)
++                        RecordCsrEdge(base, csrState);
++
++                    // Anyone could jump to this label, so the CSR state is whatever every way in agrees on
++                    // ([Switch] csrAcrossLabels; unknown when they differ or none was recorded).
++                    auto assumed = csrAcrossLabels ? csrLabelIn.find(base) : csrLabelIn.end();
++                    csrState = assumed != csrLabelIn.end() ? assumed->second : CSRState::Unknown;
++                }
+ 
+-        if (switchTable == config.switchTables.end())
+-            switchTable = config.switchTables.find(base);
++                if (switchTable == config.switchTables.end())
++                    switchTable = config.switchTables.find(base);
+ 
+-        ppc::Disassemble(data, 4, base, insn);
++                ppc::Disassemble(data, 4, base, insn);
+ 
+-        if (insn.opcode == nullptr)
+-        {
+-            println("\t// {}", insn.op_str);
++                if (insn.opcode == nullptr)
++                {
++                    println("\t// {}", insn.op_str);
+ #if 1
+-            if (*data != 0)
+-                fmt::println("Unable to decode instruction {:X} at {:X}", *data, base);
++                    if (*data != 0 && !quiet)
++                        fmt::println("Unable to decode instruction {:X} at {:X}", *data, base);
+ #endif
+-        }
+-        else
+-        {
+-            if (insn.opcode->id == PPC_INST_BCTR && (*(data - 1) == 0x07008038 || *(data - 1) == 0x00000060) && switchTable == config.switchTables.end())
+-                fmt::println("Found a switch jump table at {:X} with no switch table entry present", base);
++                    fallsThrough = true;
++                }
++                else if (skippedSaves.find(base) != skippedSaves.end())
++                {
++                    println("\t// {} {}", insn.opcode->name, insn.op_str);
++                    println("\t// callee-saved register store dropped (skipCalleeSaves)");
++                    fallsThrough = true;
++                }
++                else
++                {
++                    if (insn.opcode->id == PPC_INST_BCTR && (*(data - 1) == 0x07008038 || *(data - 1) == 0x00000060) &&
++                        switchTable == config.switchTables.end() && !quiet)
++                    {
++                        fmt::println("Found a switch jump table at {:X} with no switch table entry present", base);
++                    }
+ 
+-            if (!Recompile(fn, base, insn, data, switchTable, localVariables, csrState))
+-            {
+-                fmt::println("Unrecognized instruction at 0x{:X}: {}", base, insn.opcode->name);
+-                allRecompiled = false;
++                    if (!Recompile(fn, base, insn, data, switchTable, localVariables, csrState))
++                    {
++                        if (!quiet)
++                            fmt::println("Unrecognized instruction at 0x{:X}: {}", base, insn.opcode->name);
++                        allRecompiled = false;
++                    }
++
++                    const auto id = insn.opcode->id;
++                    fallsThrough = id != PPC_INST_B && id != PPC_INST_BLR && id != PPC_INST_BCTR;
++                }
++
++                base += 4;
++                ++data;
+             }
++
++            return allRecompiled;
++        };
++
++    // [Switch] csrAcrossLabels: print the body until the modes assumed at the labels are the ones its
++    // branches carry. Assumptions only become known ones (a branch's mode is either set by an
++    // instruction since the last label or inherited from it), so this settles; after a few passes
++    // without settling, nothing is assumed, as before.
++    csrLabelIn.clear();
++    bool allRecompiled = true;
++    for (uint32_t pass = 0; ; pass++)
++    {
++        out.clear();
++        localVariables = {};
++        csrLabelEdges.clear();
++        quiet = pass != 0;
++        allRecompiled = printBody();
++
++        if (!csrAcrossLabels)
++            break;
++
++        std::unordered_map<uint32_t, CSRState> known;
++        for (const auto& [label, state] : csrLabelEdges)
++        {
++            if (state != CSRState::Unknown)
++                known.emplace(label, state);
++        }
++
++        if (known == csrLabelIn)
++            break;
++
++        if (pass == 8)
++        {
++            csrLabelIn.clear();
++            out.clear();
++            localVariables = {};
++            allRecompiled = printBody();
++            break;
+         }
+ 
+-        base += 4;
+-        ++data;
++        csrLabelIn = std::move(known);
+     }
++    quiet = false;
+ 
+ #if 0
+     if (insn.opcode == nullptr || (insn.opcode->id != PPC_INST_B && insn.opcode->id != PPC_INST_BCTR && insn.opcode->id != PPC_INST_BLR))
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 8242db5..402bea8 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -35,6 +35,49 @@ struct Recompiler
+     size_t cppFileIndex = 0;
+     RecompilerConfig config;
+ 
++    // [Switch] Code generation (all four off with XENON_RECOMP_CLASSIC=1, for A/B builds):
++    //  - loopBarriers: PPC_LOOP_BARRIER() on every backward branch, so that guest memory accesses
++    //    can be plain ones (ppc_context.h, PPC_PLAIN_GUEST_MEMORY) and loops still read memory again
++    //    on every pass; with volatile guest memory (the default) the barrier is empty;
++    //  - skipCalleeSaves: with non-volatile registers as locals, the prologue stores of callee-saved
++    //    registers (and of the link register) write locals that nothing reads: they are dropped
++    //    (inactive with Marathon.toml's non_volatile_as_local = false);
++    //  - csrAcrossLabels: the FPSCR flush mode is known at a label when every way into it agrees,
++    //    instead of being checked again after every label;
++    //  - explicitFma: the fused multiply-adds (fmadd..., vmaddfp, vnmsubfp) through PPC_FMA/PPC_FMS
++    //    and simde_mm_vmaddfp/simde_mm_vnmsubfp (ppc_context.h). The same expressions as before unless
++    //    the build defines PPC_EXPLICIT_FMA (with -ffp-contract=off): then exactly the guest's fused
++    //    instructions are fused, whatever the compiler inlines or combines.
++    bool loopBarriers = true;
++    bool skipCalleeSaves = true;
++    bool csrAcrossLabels = true;
++
++    // [Switch] XENON_RECOMP_FEWER_MODE_SWITCHES=1 (UnleashedRecomp-NX round 14; off by default): while the flush mode is
++    // known to be the VMX one, a scalar instruction whose result does not depend on it leaves it alone instead of
++    // switching to the FPU mode (each switch is an msr fpcr, which waits for every floating-point instruction in flight).
++    // Those are the moves (fmr, fabs, fnabs, fneg, lfd, lfdx, stfd, stfdx, stfiwx), the conversions fcfid, fctidz and
++    // fctiwz, and, through exact helpers in ppc_context.h, stfs/stfsx (PPCDoubleToFloatBitsAnyMode) and fcmpu
++    // (compareBits). Not lfs, lfsx and frsp, unlike Unleashed: their double(float) tells GCC the value is a float, which
++    // lets it narrow single-precision products and sums to float arithmetic and fuse them; a helper hides that, and
++    // tools/switch-fp-check.py found 7 functions whose fused multiply-adds changed with it. In the other direction, while the FPU mode is known, the
++    // vector conversions between integers and floats (vcfsx, vcfux, vctsxs and their 128 forms) and the roundings to
++    // nearest and towards zero (vrfin, vrfiz) leave it alone: no denormal can reach or leave them differently. Where the
++    // mode is unknown the code is unchanged, so no branch is added or removed there.
++    int fewerModeSwitches = 0;
++    bool explicitFma = true;
++
++    // Per function: the flush mode assumed at each label while printing, and the meet of the modes
++    // recorded on the branches into each label (a missing entry means no branch recorded yet).
++    std::unordered_map<uint32_t, CSRState> csrLabelIn;
++    std::unordered_map<uint32_t, CSRState> csrLabelEdges;
++    void RecordCsrEdge(uint32_t target, CSRState state);
++
++    // Addresses of the prologue stores dropped by skipCalleeSaves in the current function.
++    std::unordered_set<uint32_t> skippedSaves;
++
++    // No warnings while a function body is printed only to analyse it.
++    bool quiet = false;
++
+     bool LoadConfig(const std::string_view& configFilePath);
+ 
+     template<class... Args>
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index cef1f6a..4ec5dae 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -6,6 +6,7 @@
+ #error "ppc_config.h must be included before ppc_context.h"
+ #endif
+ 
++#include <atomic>
+ #include <climits>
+ #include <cmath>
+ #include <csetjmp>
+@@ -18,6 +19,57 @@
+ #include <x86/sse.h>
+ #include <x86/sse4.1.h>
+ 
++// PowerPC memory barriers. On weakly-ordered hosts (ARM/Switch) the guest's sync/lwsync/eieio must lower
++// to real fences, or cross-thread publishes may be lost once guest code runs on more than one core; on
++// strongly-ordered x86 they collapse to compiler barriers. Either way they are compiler barriers for every
++// guest access (plain or volatile) and for the registers kept in PPCContext.
++#if defined(__aarch64__) || defined(__arm__) || defined(__SWITCH__)
++#define PPC_SYNC()   std::atomic_thread_fence(std::memory_order_seq_cst)
++#define PPC_LWSYNC() std::atomic_thread_fence(std::memory_order_acq_rel)
++#else
++#define PPC_SYNC()   std::atomic_signal_fence(std::memory_order_seq_cst)
++#define PPC_LWSYNC() std::atomic_signal_fence(std::memory_order_acq_rel)
++#endif
++
++// stwcx./stdcx.: the store happens if the word still holds what lwarx/ldarx read. PowerPC's own
++// instructions order no other access (the guest's sync, lwsync and eieio above do); the __sync builtins
++// add a full barrier (dmb ish on ARM) to every one. With g_ppcRelaxedAtomics (Switch: [Switch]
++// SwitchRelaxedAtomics, set before any guest code runs) the compare-and-swap is a relaxed one, as
++// PowerPC's. It stays a compiler barrier: the guest memory accesses around it keep their program order in
++// the generated code, which the Xbox 360's in-order cores never broke either; only the processor's own
++// reordering (as PowerPC's) remains.
++#if defined(__SWITCH__)
++extern bool g_ppcRelaxedAtomics;
++#endif
++
++static inline bool PPCStoreConditional32(uint32_t* address, uint32_t expected, uint32_t desired) noexcept
++{
++#if defined(__SWITCH__)
++    if (g_ppcRelaxedAtomics)
++    {
++        __asm__ __volatile__("" ::: "memory");
++        const bool stored = __atomic_compare_exchange_n(address, &expected, desired, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
++        __asm__ __volatile__("" ::: "memory");
++        return stored;
++    }
++#endif
++    return __sync_bool_compare_and_swap(address, expected, desired);
++}
++
++static inline bool PPCStoreConditional64(uint64_t* address, uint64_t expected, uint64_t desired) noexcept
++{
++#if defined(__SWITCH__)
++    if (g_ppcRelaxedAtomics)
++    {
++        __asm__ __volatile__("" ::: "memory");
++        const bool stored = __atomic_compare_exchange_n(address, &expected, desired, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
++        __asm__ __volatile__("" ::: "memory");
++        return stored;
++    }
++#endif
++    return __sync_bool_compare_and_swap(address, expected, desired);
++}
++
+ // GCC does not provide the Clang/MSVC builtins emitted by XenonRecomp.
+ #if defined(__GNUC__) && !defined(__clang__)
+ static inline uint32_t PPCRotateLeft32(uint32_t value, unsigned int shift) noexcept
+@@ -38,6 +90,62 @@ static inline uint64_t PPCRotateLeft64(uint64_t value, unsigned int shift) noexc
+ #define __builtin_rotateleft64(x, y) PPCRotateLeft64(static_cast<uint64_t>(x), static_cast<unsigned int>(y))
+ #endif
+ 
++// [Switch] Round 14 (XENON_RECOMP_FEWER_MODE_SWITCHES): lfs between VMX instructions, which run with FPCR.FZ set. A
++// float's conversion to double is exact in either mode except for the denormals, which FZ turns into zeros; for those
++// (biased exponent 0) the value is built from the significand instead: an integer below 2^23 times 2^-149, both exact
++// and normal as doubles, and so is their product (zeros come out as zeros, with their sign). NaNs and infinities take
++// the conversion, which FZ does not touch. No branch.
++static inline double PPCFloatToDoubleAnyMode(uint32_t bits) noexcept
++{
++    float single;
++    std::memcpy(&single, &bits, sizeof(single));
++    const double converted = double(single);
++    const double denormal = double(int32_t(bits & 0x7FFFFF)) * 0x1p-149;
++    uint64_t convertedBits;
++    uint64_t denormalBits;
++    std::memcpy(&convertedBits, &converted, sizeof(convertedBits));
++    std::memcpy(&denormalBits, &denormal, sizeof(denormalBits));
++    denormalBits |= uint64_t(bits & 0x80000000) << 32;
++    const uint64_t useDenormal = -uint64_t((bits & 0x7F800000) == 0);
++    const uint64_t result = (convertedBits & ~useDenormal) | (denormalBits & useDenormal);
++    double value;
++    std::memcpy(&value, &result, sizeof(value));
++    return value;
++}
++
++// [Switch] Round 14 (XENON_RECOMP_FEWER_MODE_SWITCHES): stfs, stfsx and frsp between VMX instructions (FPCR.FZ set). A
++// double of magnitude 2^-126 or more converts to the same float in either mode. FZ flushes anything smaller to zero (a
++// float denormal result, or a double denormal operand), so those are rounded here as they are without FZ: the
++// significand shifted to units of 2^-149 and rounded in the FPCR's rounding mode (csr, the cached FPCR: RMode in bits 22
++// and 23, 0 to nearest even, 1 towards +infinity, 2 towards -infinity, 3 towards zero); a carry into bit 23 gives the
++// smallest normal float, as the hardware's rounding does. NaNs and infinities take the conversion. No branch, and the
++// shift stays within 30 to 63 for every input, so nothing is undefined for the values whose result is not used.
++static inline uint32_t PPCDoubleToFloatBitsAnyMode(uint64_t bits, uint32_t csr) noexcept
++{
++    double value;
++    std::memcpy(&value, &bits, sizeof(value));
++    const float converted = float(value);
++    uint32_t convertedBits;
++    std::memcpy(&convertedBits, &converted, sizeof(convertedBits));
++
++    const uint64_t exponent = (bits >> 52) & 0x7FF;
++    const uint64_t significand = (bits & 0xFFFFFFFFFFFFFull) | (uint64_t(exponent != 0) << 52);
++    const int64_t rawShift = 926 - int64_t(exponent + (exponent == 0));
++    const int64_t lowShift = rawShift + ((30 - rawShift) & -int64_t(rawShift < 30));
++    const unsigned shift = unsigned(lowShift - ((lowShift - 63) & -int64_t(lowShift > 63)));
++    const uint64_t integer = significand >> shift;
++    const uint64_t remainder = significand & ((uint64_t(1) << shift) - 1);
++    const uint64_t half = uint64_t(1) << (shift - 1);
++    const uint64_t sign = bits >> 63;
++    const uint32_t mode = (csr >> 22) & 3;
++    const uint64_t inexact = remainder != 0;
++    const uint64_t nearestUp = (remainder > half) | ((remainder == half) & (integer & 1));
++    const uint64_t up = (nearestUp & (mode == 0)) | (inexact & (mode == 1) & (sign ^ 1)) | (inexact & (mode == 2) & sign);
++    const uint32_t tinyBits = uint32_t(sign << 31) | uint32_t(integer + up);
++    const uint32_t tiny = -uint32_t(exponent < 897);
++    return (convertedBits & ~tiny) | (tinyBits & tiny);
++}
++
+ // SSE3 constants are missing from simde
+ #ifndef _MM_DENORMALS_ZERO_MASK
+ #define _MM_DENORMALS_ZERO_MASK 0x0040
+@@ -53,74 +161,150 @@ static inline uint64_t PPCRotateLeft64(uint64_t value, unsigned int shift) noexc
+ 
+ #define PPC_FUNC_PROLOGUE() __builtin_assume(((size_t)base & 0x1F) == 0)
+ 
++// A function a profile found hot: GCC optimises it harder and places it in .text.hot, next to the other
++// hot ones (tools/switch-direct-calls.py marks them from MarathonRecompLib/config/hot_functions.txt).
++#define PPC_HOT_FUNC_IMPL(x) extern "C" __attribute__((hot)) PPC_FUNC(x)
++
++// Guest memory accesses. They are volatile unless PPC_PLAIN_GUEST_MEMORY is defined (a build option for the
++// recompiled code only; PPC_VOLATILE_GUEST_MEMORY always wins). Plain accesses let the compiler forward a
++// stored value to a later load of the same address, drop dead loads, pair neighbouring accesses and
++// schedule them; volatile ones force every load and store to happen, in order. Other threads see the same
++// things either way: PowerPC orders nothing without sync/lwsync/eieio or a reservation, and those stay
++// fences. What volatile also did, re-reading memory on every pass of a loop that waits for another
++// thread's store, PPC_LOOP_BARRIER() does: the recompiler puts it on every backward branch (and before
++// tail calls, which inlining can turn into loops). With volatile accesses it is not needed and is empty,
++// so the code is the same as without it.
++//
++// The barrier makes the compiler forget all memory, the guest registers kept in PPCContext included, which
++// then go back to memory on every pass of the loop. PPC_LOOP_BARRIER_BASE_ONLY (with PPC_PLAIN_GUEST_MEMORY)
++// instead makes `base` unknown: every guest access after it goes through a pointer the compiler knows
++// nothing about, so it can reuse no value read or written before and has to keep the order of the stores
++// before it and the accesses after it, while PPCContext stays in registers.
++//
++// PPC_CONFIG_NARROW_BARRIER (tools/switch-codegen-pass.py, SWITCH_NARROW_BARRIER): the barrier says it reads and
++// writes every byte of guest memory, so every guest load and store is still issued again and kept in order across it,
++// and wait loops still see other threads' stores; but it no longer covers the PPCContext (host memory only its own
++// thread uses), whose registers then stay in registers through a loop. The pass keeps PPC_LOOP_BARRIER_FULL in
++// functions with double-precision or vector floating-point arithmetic.
++#if defined(PPC_PLAIN_GUEST_MEMORY) && !defined(PPC_VOLATILE_GUEST_MEMORY)
++#define PPC_GUEST_MEMORY
++#define PPC_LOOP_BARRIER_FULL() __asm__ __volatile__("" ::: "memory")
++#ifndef PPC_LOOP_BARRIER
++#if defined(PPC_CONFIG_NARROW_BARRIER)
++#define PPC_LOOP_BARRIER() __asm__ __volatile__("" : "+m"(*(uint8_t (*)[0x100000000ull])base))
++#elif defined(PPC_LOOP_BARRIER_BASE_ONLY)
++#define PPC_LOOP_BARRIER() __asm__ __volatile__("" : "+r"(base))
++#else
++#define PPC_LOOP_BARRIER() PPC_LOOP_BARRIER_FULL()
++#endif
++#endif
++#else
++#define PPC_GUEST_MEMORY volatile
++#define PPC_LOOP_BARRIER_FULL() do { } while (0)
++#ifndef PPC_LOOP_BARRIER
++#define PPC_LOOP_BARRIER() do { } while (0)
++#endif
++#endif
++
++// [Switch] The game's data cache touch hints (dcbt, dcbtst) as host prefetches of the same guest address. They
++// change no value and no order: a prefetch is only a hint, it never faults (on any address) and the compiler does
++// not treat it as a memory access. XenonRecomp emitted nothing for them before, so the prefetches the game's
++// programmers placed were lost.
++#ifndef PPC_PREFETCH
++#if defined(__GNUC__) || defined(__clang__)
++#define PPC_PREFETCH(x) __builtin_prefetch(base + uint32_t(x), 0)
++#define PPC_PREFETCH_STORE(x) __builtin_prefetch(base + uint32_t(x), 1)
++#else
++#define PPC_PREFETCH(x) ((void)0)
++#define PPC_PREFETCH_STORE(x) ((void)0)
++#endif
++#endif
++
+ #ifndef PPC_LOAD_U8
+-#define PPC_LOAD_U8(x) *(volatile uint8_t*)(base + (x))
++#define PPC_LOAD_U8(x) *(PPC_GUEST_MEMORY uint8_t*)(base + (x))
+ #endif
+ 
+ #ifndef PPC_LOAD_U16
+-#define PPC_LOAD_U16(x) __builtin_bswap16(*(volatile uint16_t*)(base + (x)))
++#define PPC_LOAD_U16(x) __builtin_bswap16(*(PPC_GUEST_MEMORY uint16_t*)(base + (x)))
+ #endif
+ 
+ #ifndef PPC_LOAD_U32
+-#define PPC_LOAD_U32(x) __builtin_bswap32(*(volatile uint32_t*)(base + (x)))
++#define PPC_LOAD_U32(x) __builtin_bswap32(*(PPC_GUEST_MEMORY uint32_t*)(base + (x)))
+ #endif
+ 
+ #ifndef PPC_LOAD_U64
+-#define PPC_LOAD_U64(x) __builtin_bswap64(*(volatile uint64_t*)(base + (x)))
++#define PPC_LOAD_U64(x) __builtin_bswap64(*(PPC_GUEST_MEMORY uint64_t*)(base + (x)))
+ #endif
+ 
+ // TODO: Implement.
+ // These are currently unused. However, MMIO loads could possibly be handled statically with some profiling and a fallback.
+ // The fallback would be a runtime exception handler which will intercept reads from MMIO regions 
+ // and log the PC for compiling to static code later.
++// Memory-mapped accesses stay volatile whatever PPC_GUEST_MEMORY is.
+ #ifndef PPC_MM_LOAD_U8
+-#define PPC_MM_LOAD_U8(x)  PPC_LOAD_U8 (x)
++#define PPC_MM_LOAD_U8(x)  *(volatile uint8_t*)(base + (x))
+ #endif
+ 
+ #ifndef PPC_MM_LOAD_U16
+-#define PPC_MM_LOAD_U16(x) PPC_LOAD_U16(x)
++#define PPC_MM_LOAD_U16(x) __builtin_bswap16(*(volatile uint16_t*)(base + (x)))
+ #endif
+ 
+ #ifndef PPC_MM_LOAD_U32
+-#define PPC_MM_LOAD_U32(x) PPC_LOAD_U32(x)
++#define PPC_MM_LOAD_U32(x) __builtin_bswap32(*(volatile uint32_t*)(base + (x)))
+ #endif
+ 
+ #ifndef PPC_MM_LOAD_U64
+-#define PPC_MM_LOAD_U64(x) PPC_LOAD_U64(x)
++#define PPC_MM_LOAD_U64(x) __builtin_bswap64(*(volatile uint64_t*)(base + (x)))
+ #endif
+ 
+ #ifndef PPC_STORE_U8
+-#define PPC_STORE_U8(x, y) *(volatile uint8_t*)(base + (x)) = (y)
++#define PPC_STORE_U8(x, y) *(PPC_GUEST_MEMORY uint8_t*)(base + (x)) = (y)
+ #endif
+ 
+ #ifndef PPC_STORE_U16
+-#define PPC_STORE_U16(x, y) *(volatile uint16_t*)(base + (x)) = __builtin_bswap16(y)
++#define PPC_STORE_U16(x, y) *(PPC_GUEST_MEMORY uint16_t*)(base + (x)) = __builtin_bswap16(y)
+ #endif
+ 
+ #ifndef PPC_STORE_U32
+-#define PPC_STORE_U32(x, y) *(volatile uint32_t*)(base + (x)) = __builtin_bswap32(y)
++#define PPC_STORE_U32(x, y) *(PPC_GUEST_MEMORY uint32_t*)(base + (x)) = __builtin_bswap32(y)
+ #endif
+ 
+ #ifndef PPC_STORE_U64
+-#define PPC_STORE_U64(x, y) *(volatile uint64_t*)(base + (x)) = __builtin_bswap64(y)
++#define PPC_STORE_U64(x, y) *(PPC_GUEST_MEMORY uint64_t*)(base + (x)) = __builtin_bswap64(y)
+ #endif
+ 
++// [Switch] SWITCH_WIDE_DFORM (tools/switch-codegen-pass.py): a load or store at register + displacement (the D form,
++// with a register: not RA=0) as a 64-bit address, so the compiler adds the register to base once and folds the
++// displacements into the accesses (and pairs neighbours). It differs from the 32-bit sum only when that sum wraps past
++// 4 GB: the form is only used for a displacement of 0 to 4095 (or any from r1, the stack, which never sits near either
++// end), where the unwrapped address lands in the guard reserved after the 4 GB window (kernel/memory.cpp) and the fault
++// handler (os/switch/exception_switch.cpp) emulates it as the wrapped address, exactly as the 32-bit sum would have
++// accessed it.
++#define PPC_LOAD_U8_D(r, d) *(PPC_GUEST_MEMORY uint8_t*)(base + uint64_t(uint32_t(r)) + int64_t(d))
++#define PPC_LOAD_U16_D(r, d) __builtin_bswap16(*(PPC_GUEST_MEMORY uint16_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)))
++#define PPC_LOAD_U32_D(r, d) __builtin_bswap32(*(PPC_GUEST_MEMORY uint32_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)))
++#define PPC_LOAD_U64_D(r, d) __builtin_bswap64(*(PPC_GUEST_MEMORY uint64_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)))
++#define PPC_STORE_U8_D(r, d, y) *(PPC_GUEST_MEMORY uint8_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)) = (y)
++#define PPC_STORE_U16_D(r, d, y) *(PPC_GUEST_MEMORY uint16_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)) = __builtin_bswap16(y)
++#define PPC_STORE_U32_D(r, d, y) *(PPC_GUEST_MEMORY uint32_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)) = __builtin_bswap32(y)
++#define PPC_STORE_U64_D(r, d, y) *(PPC_GUEST_MEMORY uint64_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)) = __builtin_bswap64(y)
++
+ // MMIO Store handling is completely reliant on being preeceded by eieio.
+ // TODO: Verify if that's always the case.
+ #ifndef PPC_MM_STORE_U8
+-#define PPC_MM_STORE_U8(x, y)   PPC_STORE_U8 (x, y)
++#define PPC_MM_STORE_U8(x, y)   *(volatile uint8_t*)(base + (x)) = (y)
+ #endif
+ 
+ #ifndef PPC_MM_STORE_U16
+-#define PPC_MM_STORE_U16(x, y)  PPC_STORE_U16(x, y)
++#define PPC_MM_STORE_U16(x, y)  *(volatile uint16_t*)(base + (x)) = __builtin_bswap16(y)
+ #endif
+ 
+ #ifndef PPC_MM_STORE_U32
+-#define PPC_MM_STORE_U32(x, y)  PPC_STORE_U32(x, y)
++#define PPC_MM_STORE_U32(x, y)  *(volatile uint32_t*)(base + (x)) = __builtin_bswap32(y)
+ #endif
+ 
+ #ifndef PPC_MM_STORE_U64
+-#define PPC_MM_STORE_U64(x, y)  PPC_STORE_U64(x, y)
++#define PPC_MM_STORE_U64(x, y)  *(volatile uint64_t*)(base + (x)) = __builtin_bswap64(y)
+ #endif
+ 
+ #ifndef PPC_CALL_FUNC
+@@ -190,6 +374,40 @@ struct PPCCRRegister
+         so = xer.so;
+     }
+ 
++    // [Switch] Round 14 (XENON_RECOMP_FEWER_MODE_SWITCHES): fcmpu between VMX instructions, which run with FPCR.FZ set,
++    // where a compare would take a denormal operand for a zero. The same four bits as compare(double, double) without
++    // FZ, from the bit patterns: a NaN is unordered; otherwise sign and magnitude become a two's complement key, in
++    // which +0 and -0 are both 0 and the order is the numbers' order. No branch.
++    __attribute__((always_inline)) inline void compareBits(uint64_t left, uint64_t right) noexcept
++    {
++        constexpr uint64_t Magnitude = 0x7FFFFFFFFFFFFFFFull;
++        constexpr uint64_t Infinity = 0x7FF0000000000000ull;
++        const uint64_t leftMagnitude = left & Magnitude;
++        const uint64_t rightMagnitude = right & Magnitude;
++        const bool unordered = (leftMagnitude > Infinity) | (rightMagnitude > Infinity);
++        const int64_t leftSign = -int64_t(left >> 63);
++        const int64_t rightSign = -int64_t(right >> 63);
++        const int64_t leftKey = (int64_t(leftMagnitude) ^ leftSign) - leftSign;
++        const int64_t rightKey = (int64_t(rightMagnitude) ^ rightSign) - rightSign;
++        un = unordered;
++        lt = !unordered & (leftKey < rightKey);
++        gt = !unordered & (leftKey > rightKey);
++        eq = !unordered & (leftKey == rightKey);
++    }
++
++#ifdef PPC_CONFIG_INLINE_FP_COMPARE
++    // [Switch] SWITCH_INLINE_FP_COMPARE (tools/switch-codegen-pass.py): the same four bits from quiet comparisons
++    // (isless and isgreater are false for unordered operands, as == is), always inlined. GCC kept the version below
++    // out of line at thousands of fcmpu sites once a unit had grown past its inlining budget: each such site was a
++    // call that left the CR field in memory for the branch to read back, and spilled live floating-point registers.
++    __attribute__((always_inline)) inline void compare(double left, double right) noexcept
++    {
++        un = __builtin_isunordered(left, right);
++        lt = __builtin_isless(left, right);
++        gt = __builtin_isgreater(left, right);
++        eq = left == right;
++    }
++#else
+     inline void compare(double left, double right) noexcept
+     {
+         un = __builtin_isnan(left) || __builtin_isnan(right);
+@@ -197,6 +415,7 @@ struct PPCCRRegister
+         gt = !un && (left > right);
+         eq = !un && (left == right);
+     }
++#endif
+ 
+     inline void setFromMask(simde__m128 mask, int imm) noexcept
+     {
+@@ -570,7 +789,9 @@ struct alignas(0x40) PPCContext
+ #endif
+ };
+ 
+-inline uint8_t VectorMaskL[] =
++// The permute tables are constant: the compiler can fold the fixed rows into the code and needs no
++// reload of the variable ones after a guest store (mutable tables may alias any uint8_t* store).
++alignas(16) inline constexpr uint8_t VectorMaskL[] =
+ {
+     0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
+     0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+@@ -590,7 +811,7 @@ inline uint8_t VectorMaskL[] =
+     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+ };
+ 
+-inline uint8_t VectorMaskR[] =
++alignas(16) inline constexpr uint8_t VectorMaskR[] =
+ {
+     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+     0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+@@ -610,7 +831,7 @@ inline uint8_t VectorMaskR[] =
+     0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF,
+ };
+ 
+-inline uint8_t VectorShiftTableL[] =
++alignas(16) inline constexpr uint8_t VectorShiftTableL[] =
+ {
+     0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
+     0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+@@ -630,7 +851,7 @@ inline uint8_t VectorShiftTableL[] =
+     0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F,
+ };
+ 
+-inline uint8_t VectorShiftTableR[] =
++alignas(16) inline constexpr uint8_t VectorShiftTableR[] =
+ {
+     0x1F, 0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10,
+     0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F,
+@@ -650,6 +871,27 @@ inline uint8_t VectorShiftTableR[] =
+     0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+ };
+ 
++// [Switch] SWITCH_CONST_VMX_TABLES (tools/switch-codegen-pass.py): lvx/stvx/lvlx/lvrx's byte shuffles with a row of
++// VectorMaskL/R (every index 0x00-0x0F or 0xFF) as a plain NEON TBL, which gives 0 for an index of 16 or more exactly
++// as the x86 shuffle's sign bit does (simde masks every index with 0x8F first to emulate that). The pass only uses it
++// where the shuffle's index is such a row.
++#if defined(__aarch64__)
++#define PPC_VECTOR_TABLE(a, index) simde__m128i_from_neon_u8(vqtbl1q_u8(simde__m128i_to_neon_u8(a), simde__m128i_to_neon_u8(index)))
++#else
++#define PPC_VECTOR_TABLE(a, index) simde_mm_shuffle_epi8(a, index)
++#endif
++
++// [Switch] The same pass, for the shuffle with VectorMaskL's first row (the full byte reversal of lvx and stvx at an
++// aligned address), in functions without vector floating-point arithmetic only: a constant permutation GCC sees as one
++// (a TBL is opaque to it), so the reversal of a stvx after the reversal of the lvx it stores cancels out and a vector
++// copied through registers is a plain 16-byte load and store. The same bytes either way.
++#if defined(__aarch64__) && defined(__GNUC__) && !defined(__clang__)
++#define PPC_VECTOR_REVERSE(a) simde__m128i_from_neon_u8(__builtin_shuffle(simde__m128i_to_neon_u8(a), \
++    (uint8x16_t){ 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 }))
++#else
++#define PPC_VECTOR_REVERSE(a) simde_mm_shuffle_epi8(a, simde_mm_load_si128((simde__m128i*)VectorMaskL))
++#endif
++
+ inline simde__m128i simde_mm_adds_epu32(simde__m128i a, simde__m128i b)
+ {
+     return simde_mm_add_epi32(a, simde_mm_min_epu32(simde_mm_xor_si128(a, simde_mm_cmpeq_epi32(a, a)), b));
+@@ -681,9 +923,57 @@ inline simde__m128 simde_mm_cvtepu32_ps_(simde__m128i src1)
+ 
+ inline simde__m128i simde_mm_perm_epi8_(simde__m128i a, simde__m128i b, simde__m128i c)
+ {
++#if defined(SIMDE_ARM_NEON_A64V8_NATIVE)
++    // vperm on byte-reversed registers: result[i] = (c[i] & 0x10 ? b : a)[15 - (c[i] & 0xF)]. With the
++    // table {b, a} (bytes 0-15 = b, 16-31 = a) that is table[31 - (c[i] & 0x1F)], and 31 - x == 0x1F & ~x for
++    // x < 32: one bic and one two-register tbl instead of two shuffles and a blend (same bytes, tested
++    // exhaustively against this simde path).
++    const uint8x16x2_t table = { { simde__m128i_to_neon_u8(b), simde__m128i_to_neon_u8(a) } };
++    const uint8x16_t index = vbicq_u8(vdupq_n_u8(0x1F), simde__m128i_to_neon_u8(c));
++    return simde__m128i_from_neon_u8(vqtbl2q_u8(table, index));
++#else
+     simde__m128i d = simde_mm_set1_epi8(0xF);
+     simde__m128i e = simde_mm_sub_epi8(d, simde_mm_and_si128(c, d));
+     return simde_mm_blendv_epi8(simde_mm_shuffle_epi8(a, e), simde_mm_shuffle_epi8(b, e), simde_mm_slli_epi32(c, 3));
++#endif
++}
++
++// The guest's fused multiply-adds (fmadd, fmsub, fnmadd, fnmsub and their single forms; vmaddfp and
++// vnmsubfp) round a * b + c once; its separate multiplies and adds round twice. Written as a plain
++// multiply and add, whether they are fused is up to the compiler: GCC's default -ffp-contract=fast fuses
++// every multiply into an add of its result that it can see, also one from another guest instruction (a
++// fmul into a later fadd, a vmulfp128 into a vaddfp) once the register store between them is dead, and it
++// leaves a guest fused op unfused when its product is shared or it fused the other operand instead. What
++// it sees changes with inlining, LTO, PGO and every flag. With PPC_EXPLICIT_FMA (AArch64, built with
++// -ffp-contract=off) the fused guest instructions are fused explicitly and nothing else is: the results
++// then follow the guest's roundings and no longer depend on the optimiser. Without it these are the
++// plain expressions the recompiler has always emitted.
++#if defined(PPC_EXPLICIT_FMA) && defined(__aarch64__)
++#define PPC_FMA(a, b, c) __builtin_fma(a, b, c)
++#define PPC_FMS(a, b, c) __builtin_fma(a, b, -(c))
++#else
++#define PPC_FMA(a, b, c) ((a) * (b) + (c))
++#define PPC_FMS(a, b, c) ((a) * (b) - (c))
++#endif
++
++inline simde__m128 simde_mm_vmaddfp(simde__m128 a, simde__m128 b, simde__m128 c)
++{
++#if defined(PPC_EXPLICIT_FMA) && defined(SIMDE_ARM_NEON_A64V8_NATIVE)
++    return simde__m128_from_neon_f32(vfmaq_f32(simde__m128_to_neon_f32(c), simde__m128_to_neon_f32(a), simde__m128_to_neon_f32(b)));
++#else
++    return simde_mm_add_ps(simde_mm_mul_ps(a, b), c);
++#endif
++}
++
++// -(a * b - c): a * b + (-c) with one rounding, then the sign flipped.
++inline simde__m128 simde_mm_vnmsubfp(simde__m128 a, simde__m128 b, simde__m128 c)
++{
++#if defined(PPC_EXPLICIT_FMA) && defined(SIMDE_ARM_NEON_A64V8_NATIVE)
++    const simde__m128 d = simde__m128_from_neon_f32(vfmaq_f32(vnegq_f32(simde__m128_to_neon_f32(c)), simde__m128_to_neon_f32(a), simde__m128_to_neon_f32(b)));
++#else
++    const simde__m128 d = simde_mm_sub_ps(simde_mm_mul_ps(a, b), c);
++#endif
++    return simde_mm_xor_ps(d, simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000))));
+ }
+ 
+ inline simde__m128i simde_mm_cmpgt_epu8(simde__m128i a, simde__m128i b)

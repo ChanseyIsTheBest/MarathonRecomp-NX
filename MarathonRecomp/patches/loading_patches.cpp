@@ -9,6 +9,10 @@ PPC_FUNC(sub_824D7340)
 
     if ((pHUDLoading->m_Flags.get() & Sonicteam::HUDLoading::HUDLoadingFlags_Finished) == 0)
     {
+#if defined(__SWITCH__)
+        LoadingPatches::s_activeUpdates.fetch_add(1, std::memory_order_relaxed);
+#endif
+
         for (auto& event : LoadingPatches::Events)
             event->Update(ctx.f1.f64);
     }

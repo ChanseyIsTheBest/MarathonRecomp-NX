@@ -108,3 +108,19 @@ CONFIG_DEFINE_HIDDEN("Codes", bool, UseOfficialAchievementText, false, false);
 CONFIG_DEFINE_HIDDEN("Codes", bool, UseOfficialTitleOnTitleBar, false, true);
 
 CONFIG_DEFINE("Update", time_t, LastChecked, 0, false);
+
+#if defined(__SWITCH__)
+// [Switch] performance and diagnostics switches (docs/SWITCH-PERFORMANCE.md). Keep this block last:
+// Config::Save writes the keys in declaration order, and a section split in two makes toml++ reject
+// the whole file. Each area keeps its keys in a file of its own, all included here in one run.
+// Release defaults (1.0.3): every optimisation the test builds kept on stays on (the comments above some keys still
+// say why they were off at first), the SaltyNX FPS overlay and the handheld GPU profile are on; logging (SwitchLog),
+// the CPU and GPU profilers and the stall watchdog are off, so neither stderr.log nor MarathonRecomp.log is written
+// (crash.log still is, on a crash).
+#include "switch/config_codegen.inl"
+#include "switch/config_renderer.inl"
+#include "switch/config_kernel.inl"
+#include "switch/config_native.inl"
+#include "switch/config_audio.inl"
+#include "switch/config_diagnostics.inl"
+#endif

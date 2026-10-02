@@ -1,0 +1,58 @@
+# [Switch] SWITCH_FP_NO_CONTRACT (tools/switch-codegen-pass.py): floating-point functions compiled with their registers
+# in locals, without contraction, their guest fused operations spelled fused. One address per line ('#' comments).
+# A function is listed only where it is exact: the ELF of the previous build (its context form, GCC's default
+# contraction) had exactly as many fused instructions as guest fused operations and as many plain multiplies as guest
+# separate multiplies (counting the callees GCC inlined into it), so the same operations round the same way.
+# perf8: and only where it pays: compiled without LTO, the locals form has fewer loads and stores than the context
+# form, at most 8 more stack slots, and the same fused, multiply and add instructions (49 of perf7's 145 and the new
+# candidates; the others went back to the context form, several with their integer registers in locals instead).
+# Havok's MOPP query (828844E8) is SWITCH_FP_SINGLE_MODE (FP_SINGLE_MODE in the pass), not listed here.
+82166E50
+8218C5C0
+821EE778
+82202B08
+82232DB0
+82233290
+822334D8
+8223BA58
+824B8158
+82580D60
+82596D00
+825A07C0
+825A0B80
+825A0D80
+825A1490
+825D13F0
+825D14C8
+825D2330
+825D2350
+825D2AA8
+825D3DB0
+825D45C8
+825F30E0
+82613E20
+82614610
+826452C0
+8266F038
+82676AF8
+82677098
+826E01B0
+826E0460
+826E0AD0
+8277B200
+82866028
+82866F30
+8287F6A0
+828CBC08
+829093A8
+82909600
+8290A0A8
+8290A9A8
+8290ED90
+8290FC08
+82910340
+82ABAB20
+82ABB460
+82ABBFF0
+82ABEFE0
+82AD5C98

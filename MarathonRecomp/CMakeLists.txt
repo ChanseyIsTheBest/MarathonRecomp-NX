@@ -119,6 +119,17 @@ if (MARATHON_RECOMP_SWITCH)
     if (NOT PLUME_SWITCH_NVK_LIBRARY OR NOT EXISTS "${PLUME_SWITCH_NVK_LIBRARY}")
         list(APPEND MARATHON_RECOMP_OS_CXX_SOURCES "os/switch/nvk_icd_stub.cpp")
     endif()
+    # Switch performance and diagnostics modules (docs/SWITCH-PERFORMANCE.md): every source in
+    # os/switch/perf is built, so a new module needs no change here. C sources skip the C++ PCH.
+    file(GLOB MARATHON_RECOMP_SWITCH_PERF_CXX_SOURCES CONFIGURE_DEPENDS
+        RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/os/switch/perf/*.cpp")
+    file(GLOB MARATHON_RECOMP_SWITCH_PERF_C_SOURCES CONFIGURE_DEPENDS
+        RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/os/switch/perf/*.c")
+    list(APPEND MARATHON_RECOMP_OS_CXX_SOURCES
+        ${MARATHON_RECOMP_SWITCH_PERF_CXX_SOURCES} ${MARATHON_RECOMP_SWITCH_PERF_C_SOURCES})
+    if (MARATHON_RECOMP_SWITCH_PERF_C_SOURCES)
+        set_source_files_properties(${MARATHON_RECOMP_SWITCH_PERF_C_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+    endif()
 elseif (WIN32)
     set(MARATHON_RECOMP_OS_CXX_SOURCES
         "os/win32/logger_win32.cpp"
@@ -498,7 +509,121 @@ target_link_libraries(MarathonRecomp PRIVATE
 target_link_libraries(MarathonRecomp PRIVATE ffmpeg)
 
 if (MARATHON_RECOMP_SWITCH)
-    target_link_libraries(MarathonRecomp PRIVATE nx)
+    # z: the native archive inflate (os/switch/perf/native_inflate.cpp). It used to resolve only through the
+    # driver's extra libraries.
+    target_link_libraries(MarathonRecomp PRIVATE z nx)
+
+    # Host hooks and the app's own guest-memory accesses can fault into os/switch/exception_switch.cpp as
+    # well, which resumes them through x16 (see MarathonRecompLib/CMakeLists.txt). At the link for the code
+    # compiled there from LTO objects (lto-wrapper takes -ffixed-* from the link line, not from each object).
+    if (MARATHON_RECOMP_SWITCH_FIXED_X16)
+        target_compile_options(MarathonRecomp PRIVATE -ffixed-x16)
+        target_link_options(MarathonRecomp PRIVATE -ffixed-x16)
+    endif()
+
+    # Profile-guided optimisation in two builds from the same build folder (docs/BUILDING-SWITCH.md):
+    #   generate: instrumented build; os/switch/perf/pgo_switch.cpp dumps the .gcda files to
+    #             sdmc:/switch/MarathonRecomp/pgo (its __wrap_fopen maps MARATHON_RECOMP_SWITCH_PGO_DIR
+    #             there). Build it without LTO.
+    #   use:      rebuild with those files copied into MARATHON_RECOMP_SWITCH_PGO_DIR.
+    # -fprofile-prefix-path makes each .gcda name relative to the build folder, in the host's native
+    # form, so the names match between the console and the PC. -fno-profile-values is mandatory:
+    # libgcov's value profiler reads TLS through tpidr_el0, which is 0 with libnx's -mtp=soft.
+    if (MARATHON_RECOMP_SWITCH_PGO)
+        get_filename_component(MARATHON_RECOMP_PGO_DIR "${MARATHON_RECOMP_SWITCH_PGO_DIR}" ABSOLUTE)
+        file(TO_NATIVE_PATH "${CMAKE_BINARY_DIR}" MARATHON_RECOMP_PGO_PREFIX)
+        if (MARATHON_RECOMP_SWITCH_PGO STREQUAL "generate")
+            if (MARATHON_RECOMP_SWITCH_LTO)
+                message(FATAL_ERROR "MARATHON_RECOMP_SWITCH_PGO=generate needs MARATHON_RECOMP_SWITCH_LTO=OFF")
+            endif()
+            set(MARATHON_RECOMP_PGO_OPTIONS -fprofile-generate=${MARATHON_RECOMP_PGO_DIR}
+                "-fprofile-prefix-path=${MARATHON_RECOMP_PGO_PREFIX}" -fprofile-update=single -fno-profile-values)
+            target_link_options(MarathonRecomp PRIVATE -fprofile-generate -Wl,--wrap=fopen)
+            target_compile_definitions(MarathonRecomp PRIVATE MARATHON_RECOMP_SWITCH_PGO_GENERATE=1
+                "MARATHON_RECOMP_SWITCH_PGO_DIR=\"${MARATHON_RECOMP_PGO_DIR}\"")
+        elseif (MARATHON_RECOMP_SWITCH_PGO STREQUAL "use")
+            # -fprofile-correction: counters updated from several threads without synchronisation
+            # (-fprofile-update=single) can come out negative, which GCC otherwise rejects.
+            set(MARATHON_RECOMP_PGO_OPTIONS -fprofile-use=${MARATHON_RECOMP_PGO_DIR}
+                "-fprofile-prefix-path=${MARATHON_RECOMP_PGO_PREFIX}" -fprofile-partial-training
+                -fno-profile-values -fprofile-correction -Wno-missing-profile -Wno-error=coverage-mismatch)
+            target_link_options(MarathonRecomp PRIVATE -fprofile-use -fprofile-partial-training -fprofile-correction)
+            # GCC reads the .gcda files outside the preprocessor, so no depfile names them and a refreshed
+            # profile would rebuild nothing. Their names and contents go into every compile line instead (an
+            # unused define), so a new profile rebuilds every object and its LTO IR. A changed, added or
+            # removed .gcda reconfigures (CONFIGURE_DEPENDS re-globs at build time).
+            file(GLOB_RECURSE MARATHON_RECOMP_PGO_FILES CONFIGURE_DEPENDS "${MARATHON_RECOMP_PGO_DIR}/*.gcda")
+            list(SORT MARATHON_RECOMP_PGO_FILES)
+            set(MARATHON_RECOMP_PGO_PROFILE_HASHES "")
+            foreach(pgo_file IN LISTS MARATHON_RECOMP_PGO_FILES)
+                file(SHA256 "${pgo_file}" pgo_file_hash)
+                file(RELATIVE_PATH pgo_file_name "${MARATHON_RECOMP_PGO_DIR}" "${pgo_file}")
+                string(APPEND MARATHON_RECOMP_PGO_PROFILE_HASHES "${pgo_file_name}=${pgo_file_hash};")
+            endforeach()
+            if (NOT MARATHON_RECOMP_PGO_FILES)
+                message(WARNING "MARATHON_RECOMP_SWITCH_PGO=use: no .gcda files in ${MARATHON_RECOMP_PGO_DIR}")
+            endif()
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${MARATHON_RECOMP_PGO_FILES})
+            string(SHA256 MARATHON_RECOMP_PGO_PROFILE_ID "${MARATHON_RECOMP_PGO_PROFILE_HASHES}")
+            string(SUBSTRING "${MARATHON_RECOMP_PGO_PROFILE_ID}" 0 16 MARATHON_RECOMP_PGO_PROFILE_ID)
+            list(APPEND MARATHON_RECOMP_PGO_OPTIONS -DMARATHON_RECOMP_SWITCH_PGO_PROFILE_ID=${MARATHON_RECOMP_PGO_PROFILE_ID})
+        else()
+            message(FATAL_ERROR "MARATHON_RECOMP_SWITCH_PGO must be empty, generate or use (is '${MARATHON_RECOMP_SWITCH_PGO}')")
+        endif()
+        message(STATUS "Switch: PGO ${MARATHON_RECOMP_SWITCH_PGO} (${MARATHON_RECOMP_PGO_DIR})")
+        foreach(pgo_target MarathonRecompLib MarathonRecomp)
+            target_compile_options(${pgo_target} PRIVATE ${MARATHON_RECOMP_PGO_OPTIONS})
+        endforeach()
+    endif()
+
+    # The build ID and the driver ID as a generated header (a -D would not match the precompiled header),
+    # rewritten only when its content changes. Include it from the one source file that prints it, not from
+    # stdafx.h: the build ID changes with every build of tools/build-switch.sh.
+    set(MARATHON_RECOMP_SWITCH_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated")
+    # The SHA-256 of the NVK driver library linked in, which keys the persistent pipeline cache. The configure
+    # step runs again when the library changes, so the key follows the driver.
+    set(MARATHON_RECOMP_SWITCH_DRIVER_ID "")
+    if (PLUME_SWITCH_NVK_LIBRARY AND EXISTS "${PLUME_SWITCH_NVK_LIBRARY}")
+        file(SHA256 "${PLUME_SWITCH_NVK_LIBRARY}" MARATHON_RECOMP_SWITCH_DRIVER_ID)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PLUME_SWITCH_NVK_LIBRARY}")
+    endif()
+    # The SHA-256 of the generated game shader cache, also in the pipeline cache key: when the translator's output
+    # changes, the pipelines of the old shaders can never be used again, so the cache starts afresh instead of
+    # carrying them until its size cap.
+    set(MARATHON_RECOMP_SWITCH_SHADER_ID "")
+    set(MARATHON_RECOMP_SWITCH_SHADER_CACHE_SOURCE "${CMAKE_SOURCE_DIR}/MarathonRecompLib/shader/shader_cache.cpp")
+    if (EXISTS "${MARATHON_RECOMP_SWITCH_SHADER_CACHE_SOURCE}")
+        file(SHA256 "${MARATHON_RECOMP_SWITCH_SHADER_CACHE_SOURCE}" MARATHON_RECOMP_SWITCH_SHADER_ID)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MARATHON_RECOMP_SWITCH_SHADER_CACHE_SOURCE}")
+    endif()
+    # The compiler options this build was configured with, whatever the build ID says.
+    set(MARATHON_RECOMP_SWITCH_BUILD_OPTIONS "")
+    if (MARATHON_RECOMP_SWITCH_LTO)
+        string(APPEND MARATHON_RECOMP_SWITCH_BUILD_OPTIONS " lto=${MARATHON_RECOMP_SWITCH_LTO_JOBS}")
+    endif()
+    if (MARATHON_RECOMP_SWITCH_PGO)
+        string(APPEND MARATHON_RECOMP_SWITCH_BUILD_OPTIONS " pgo-${MARATHON_RECOMP_SWITCH_PGO}")
+        if (MARATHON_RECOMP_PGO_PROFILE_ID)
+            string(APPEND MARATHON_RECOMP_SWITCH_BUILD_OPTIONS " pgo_profile=${MARATHON_RECOMP_PGO_PROFILE_ID}")
+        endif()
+    endif()
+    foreach(build_option O2 RECOMP_O2 IPA_PTA CLASSIC_CODEGEN FIXED_X16 PLAIN_GUEST_MEMORY)
+        if (MARATHON_RECOMP_SWITCH_${build_option})
+            string(TOLOWER "${build_option}" build_option_name)
+            string(APPEND MARATHON_RECOMP_SWITCH_BUILD_OPTIONS " ${build_option_name}")
+        endif()
+    endforeach()
+    # Only when it is really used (root CMakeLists.txt: not classic, and ppc/ has the explicit fma).
+    if (MARATHON_RECOMP_SWITCH_EXACT_FMA_ACTIVE)
+        string(APPEND MARATHON_RECOMP_SWITCH_BUILD_OPTIONS " exact_fma")
+    endif()
+    if (MARATHON_RECOMP_SWITCH_CODEGEN_OPTIONS)
+        string(APPEND MARATHON_RECOMP_SWITCH_BUILD_OPTIONS " ${MARATHON_RECOMP_SWITCH_CODEGEN_OPTIONS}")
+    endif()
+    string(STRIP "${MARATHON_RECOMP_SWITCH_BUILD_OPTIONS}" MARATHON_RECOMP_SWITCH_BUILD_OPTIONS)
+    file(CONFIGURE OUTPUT "${MARATHON_RECOMP_SWITCH_GENERATED_DIR}/switch_build_id.h"
+        CONTENT "#pragma once\n#define MARATHON_RECOMP_SWITCH_BUILD_ID \"@MARATHON_RECOMP_SWITCH_BUILD_ID@\"\n#define MARATHON_RECOMP_SWITCH_BUILD_OPTIONS \"@MARATHON_RECOMP_SWITCH_BUILD_OPTIONS@\"\n#define MARATHON_RECOMP_SWITCH_DRIVER_ID \"@MARATHON_RECOMP_SWITCH_DRIVER_ID@\"\n#define MARATHON_RECOMP_SWITCH_SHADER_ID \"@MARATHON_RECOMP_SWITCH_SHADER_ID@\"\n" @ONLY)
+    target_include_directories(MarathonRecomp PRIVATE "${MARATHON_RECOMP_SWITCH_GENERATED_DIR}")
 endif()
 
 target_include_directories(MarathonRecomp PRIVATE
@@ -590,6 +715,14 @@ compile_pixel_shader(resolve_msaa_color_8x)
 compile_pixel_shader(resolve_msaa_depth_2x)
 compile_pixel_shader(resolve_msaa_depth_4x)
 compile_pixel_shader(resolve_msaa_depth_8x)
+
+if (MARATHON_RECOMP_SWITCH)
+    # Switch-only variants that gpu/video.cpp picks up with __has_include (tools/generate-switch-app-shaders.sh
+    # makes the same headers for the pregenerated build).
+    compile_pixel_shader(conditional_survey_store_ps)
+    compile_pixel_shader(gamma_correction_push_ps)
+    compile_pixel_shader(conditional_survey_slots_ps)
+endif()
 
 function(generate_aggregate_header INPUT_DIRECTORY OUTPUT_FILE)
     get_filename_component(ABS_OUTPUT_FILE "${OUTPUT_FILE}" ABSOLUTE)

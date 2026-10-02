@@ -92,12 +92,19 @@ bool MapSwitchProcessMemoryRange(Memory& memory, size_t offset, size_t size) noe
     // is capped at ~2.25 GB of total mappings. 2 MB-align large chunks so the
     // kernel can use block descriptors.
     constexpr size_t SWITCH_MAP_BLOCK_SIZE = 0x200000;
-    const size_t mapAlign =
+    size_t mapAlign =
         (alignedSize >= SWITCH_MAP_BLOCK_SIZE && (alignedOffset & (SWITCH_MAP_BLOCK_SIZE - 1)) == 0)
             ? SWITCH_MAP_BLOCK_SIZE
             : SWITCH_PAGE_SIZE;
 
     void* backing = memalign(mapAlign, alignedSize);
+    // [Switch] A 2 MB-aligned block may not be available where a 4 KB-aligned one is: then the commit is mapped with
+    // 4 KB pages, as before, rather than failing.
+    if (backing == nullptr && mapAlign != SWITCH_PAGE_SIZE)
+    {
+        mapAlign = SWITCH_PAGE_SIZE;
+        backing = memalign(mapAlign, alignedSize);
+    }
     if (backing == nullptr)
     {
         memory.switchInitFailureReason = "Switch backing allocation failed";
@@ -113,6 +120,8 @@ bool MapSwitchProcessMemoryRange(Memory& memory, size_t offset, size_t size) noe
 
     virtmemLock();
     codeAlias = virtmemFindCodeMemory(alignedSize, mapAlign);
+    if (codeAlias == nullptr && mapAlign != SWITCH_PAGE_SIZE)
+        codeAlias = virtmemFindCodeMemory(alignedSize, SWITCH_PAGE_SIZE);
     if (codeAlias != nullptr)
     {
         rc = svcMapProcessCodeMemory(envGetOwnProcessHandle(), reinterpret_cast<uintptr_t>(codeAlias), reinterpret_cast<uintptr_t>(backing), alignedSize);
@@ -187,7 +196,12 @@ bool MapSwitchProcessMemoryRange(Memory& memory, size_t offset, size_t size) noe
 extern "C" void PPCIndirectCallTrap(PPCContext& ctx, uint8_t* base, uint32_t target)
 {
     (void)base;
+#if !defined(PPC_CONFIG_SKIP_LR)
     const uint32_t caller = static_cast<uint32_t>(ctx.lr);
+#else
+    // Generated with XENON_RECOMP_REGISTER_LOCALS=1 (skip_lr): the link register is not kept.
+    const uint32_t caller = 0;
+#endif
 
     static std::mutex s_mutex;
     static std::unordered_set<uint32_t> s_seen;
@@ -209,7 +223,13 @@ namespace
 // resolved target in ctr, so forward it to the shared trap.
 void MissingFunctionTrap(PPCContext& __restrict__ ctx, uint8_t* base)
 {
+#if !defined(PPC_CONFIG_CTR_AS_LOCAL)
     PPCIndirectCallTrap(ctx, base, ctx.ctr.u32);
+#else
+    // Generated with XENON_RECOMP_REGISTER_LOCALS=1: ctr is a local of the caller, the target is unknown here
+    // (logged as 0). The trap still returns a null result, as before.
+    PPCIndirectCallTrap(ctx, base, 0);
+#endif
 }
 }
 #endif
@@ -242,9 +262,10 @@ Memory::Memory()
     virtmemLock();
     // 2 MB-aligned so large commits can map with 2 MB blocks where the
     // physical layout allows (see MapSwitchProcessMemoryRange).
-    base = static_cast<uint8_t*>(virtmemFindAslr(PPC_MEMORY_SIZE, 0x200000));
+    // One more 64 KB after the 4 GB window, reserved and never committed: see SWITCH_WRAP_GUARD_SIZE.
+    base = static_cast<uint8_t*>(virtmemFindAslr(PPC_MEMORY_SIZE + SWITCH_WRAP_GUARD_SIZE, 0x200000));
     if (base != nullptr)
-        reservation = virtmemAddReservation(base, PPC_MEMORY_SIZE);
+        reservation = virtmemAddReservation(base, PPC_MEMORY_SIZE + SWITCH_WRAP_GUARD_SIZE);
     virtmemUnlock();
 
     if (base == nullptr)

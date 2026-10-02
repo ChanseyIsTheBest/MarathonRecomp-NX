@@ -1,6 +1,13 @@
 #include "../../../../tools/XenosRecomp/XenosRecomp/shader_common.h"
 
-#ifdef __spirv__
+#if defined(__spirv__) && defined(MARATHON_RECOMP_SWITCH_APP_SHADERS) && defined(SPEC_CONSTANT_CONSTANTS_UBO)
+
+// [Switch] Constants: from the set 5 uniform buffers when the pipeline has SPEC_CONSTANT_CONSTANTS_UBO (NVK reads
+// them from a hardware constant bank), otherwise through the push constant pointers, as before. Same registers.
+#define g_ViewportSize (UR_CONSTANTS_UBO ? g_UboVertex.v[180] : vk::RawBufferLoad<float4>(g_PushConstants.VertexShaderConstants + 2880, 0x10))
+#define g_Z (UR_CONSTANTS_UBO ? g_UboVertex.v[246] : vk::RawBufferLoad<float4>(g_PushConstants.VertexShaderConstants + 3936, 0x10))
+
+#elif defined(__spirv__)
 
 #define g_ViewportSize vk::RawBufferLoad<float4>(g_PushConstants.VertexShaderConstants + 2880, 0x10)
 #define g_Z vk::RawBufferLoad<float4>(g_PushConstants.VertexShaderConstants + 3936, 0x10)

@@ -39,6 +39,9 @@ if [[ ! -x "${dxc}" ]]; then
   exit 1
 fi
 
+# MARATHON_RECOMP_SWITCH_APP_SHADERS: these are the Switch build's shaders. csd_vs, csd_no_tex_vs and
+# blend_color_alpha_ps then also read their constants through the SwitchConstantsUBO uniform buffers; a build that
+# compiles the app shaders itself (PC) keeps them as they were. The other shaders do not test it.
 compile_shader() {
   local name="$1"
   local target="$2"
@@ -52,6 +55,7 @@ compile_shader() {
     -fvk-use-dx-layout \
     "$@" \
     -DMARATHON_RECOMP \
+    -DMARATHON_RECOMP_SWITCH_APP_SHADERS \
     -E shaderMain \
     -Fh "${shader_dir}/${name}.hlsl.spirv.h" \
     "${shader_dir}/${name}.hlsl" \
@@ -90,3 +94,9 @@ compile_pixel_shader resolve_msaa_color_8x
 compile_pixel_shader resolve_msaa_depth_2x
 compile_pixel_shader resolve_msaa_depth_4x
 compile_pixel_shader resolve_msaa_depth_8x
+
+# Switch-only variants (SPIR-V only; MarathonRecomp/CMakeLists.txt lists them under MARATHON_RECOMP_SWITCH). gpu/video.cpp uses them when their
+# headers exist: SwitchSurveyPlainStore, SwitchGammaPushConstants and SwitchSurveySlots.
+compile_pixel_shader conditional_survey_store_ps
+compile_pixel_shader gamma_correction_push_ps
+compile_pixel_shader conditional_survey_slots_ps

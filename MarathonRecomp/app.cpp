@@ -136,9 +136,10 @@ PPC_FUNC(sub_82582648)
     // it without any chance of faulting: a sane bounded length, fully inside
     // committed guest memory, and formatted as an explicitly sized view so no
     // strlen scan can run off into unmapped pages.
+    // Only when the line is written: IsRangeCommitted takes the commit mutex on every file load.
     const uint32_t pathOffset = pFile->pFilePath.ptr;
     const uint32_t pathLength = pFile->Length;
-    if (pathOffset != 0 && pathLength > 0 && pathLength < 0x1000 &&
+    if (os::logger::IsEnabled() && pathOffset != 0 && pathLength > 0 && pathLength < 0x1000 &&
         g_memory.IsRangeCommitted(pathOffset, pathLength))
     {
         LOGFN_UTILITY("Loading file: {}",

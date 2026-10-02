@@ -95,6 +95,23 @@ struct XmaPlaybackStream {
     std::atomic<bool> decoderWorking { false };
     std::atomic<bool> isRunning { true };
 
+#if defined(__SWITCH__)
+    // [Switch] SwitchXmaEventWait: the decoder sleeps on its own condition variable until a pass can make
+    // progress. Every change that can allow one (resume, submit, flush, destroy) calls NotifyDecoderLocked.
+    std::condition_variable decoderCv;
+    uint32_t decoderWakeGeneration = 0; // Under mutex.
+    bool decoderWaiting = false;        // Under mutex: the decoder is inside decoderCv.wait_for.
+
+    // Caller holds `mutex`. A decoder that is not waiting re-checks its predicate, and sees the new
+    // generation, before it waits again, so skipping the notify then loses nothing.
+    void NotifyDecoderLocked() {
+        decoderWakeGeneration++;
+        if (decoderWaiting) {
+            decoderCv.notify_one();
+        }
+    }
+#endif
+
     XmaPlaybackStream(uint32_t sampleRate, uint32_t outputBufferSize,
                 uint32_t channelCount, uint32_t subframes)
                 : sampleRate(sampleRate), outputBufferSize(outputBufferSize),
@@ -170,6 +187,9 @@ struct XmaPlaybackStream {
             std::lock_guard<std::mutex> lock(mutex);
             isRunning = false;
             cv.notify_one();
+#if defined(__SWITCH__)
+            NotifyDecoderLocked();
+#endif
         }
 
 #if defined(__SWITCH__)

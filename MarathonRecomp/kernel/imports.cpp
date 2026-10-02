@@ -23,25 +23,83 @@
 
 std::unordered_map<uint32_t, uint32_t> g_handleDuplicates{};
 
+#if defined(__SWITCH__)
+// libnx system calls, declared here: <switch.h> would bring libnx's Event and Semaphore types, which collide with the
+// dispatcher objects below.
+extern "C"
+{
+    uint32_t svcWaitForAddress(void* address, uint32_t arbType, int64_t value, int64_t timeoutNs);
+    uint32_t svcSignalToAddress(void* address, uint32_t signalType, int32_t value, int32_t count);
+    void svcSleepThread(int64_t nano);
+    void* __aarch64_read_tp(void);
+}
+
+// [Switch] Guest-kernel switches ([Switch] keys of user/switch/config_kernel.inl), set once by SwitchPerfInitKernel
+// (os/switch/perf/kernel_switch.cpp) after the configuration is loaded, before any guest code runs.
+
+// SwitchFastEvents. A condition variable's notify is a system call on Horizon (svcSignalProcessWideKey) whether a
+// thread waits on it or not, and setting an event or releasing a semaphore made two (the object's, then the
+// dispatcher's for KeWaitForMultipleObjects). With this on, each wait counts its waiters under its mutex, and a
+// notify happens only when there are some: a thread counted is inside the wait, or will check its condition under
+// the mutex (after the change, which it then sees) before it waits.
+bool g_fastEvents = false;
+// SwitchSemaphoreWakeCount. Releasing N units of a semaphore woke every waiter (notify_all), and all but N of them
+// found the count at 0 again and went back to sleep. With this on, a release of fewer units than there are
+// waiters wakes N of them, one notify each (see Semaphore::Release).
+bool g_semaphoreWakeCount = false;
+// SwitchTargetedDispatcherWakeups (UnleashedRecomp-NX round 14). Every event set and semaphore release advanced the
+// dispatcher generation under its global mutex and woke every KeWaitForMultipleObjects caller, whatever it waited on:
+// the audio pump waits there all the time, so every Set and Release of the game (thousands a frame, on the game
+// thread too) took that mutex and made a wake-up system call, and the pump woke to find its own objects unchanged.
+// Each event and semaphore now counts the KeWaitForMultipleObjects calls that wait on it (registered under its mutex
+// before they look at it), and only a signal of an object with such waiters advances the generation. A waiter
+// registered before the signal's critical section is notified; one registered after it sees the new state when it
+// looks. Resets and waits never make a waiter's condition true, so nothing else needs the generation.
+bool g_targetedDispatcherWakeups = false;
+// SwitchEventSpin: a wait without timeout on an event that is not set watches it (reads only, ~2 us) before it takes
+// the event's mutex and sleeps. The game thread waits for its job workers' events every frame (2.1 ms a frame in the
+// perf5 profile), and a job that is about to finish then costs neither the sleep's system calls nor the wake-up. The
+// wait itself is unchanged: it takes the mutex and checks the event as before.
+bool g_eventSpin = false;
+#else
+static constexpr bool g_fastEvents = false;
+static constexpr bool g_semaphoreWakeCount = false;
+static constexpr bool g_targetedDispatcherWakeups = false;
+static constexpr bool g_eventSpin = false;
+#endif
+
 // std::atomic wait/notify is not reliable on Horizon's newlib, so all of the
 // dispatcher objects are built on mutex + condition variable instead.
 static std::atomic<uint32_t> g_dispatcherGeneration;
 static std::mutex g_dispatcherMutex;
 static std::condition_variable g_dispatcherCv;
+static uint32_t g_dispatcherWaiters; // Under g_dispatcherMutex.
 
 static void NotifyDispatcherWaiters()
 {
-    g_dispatcherGeneration.fetch_add(1, std::memory_order_release);
-    g_dispatcherCv.notify_all();
+    // Advance the generation under the mutex so KeWaitForMultipleObjects waiters reliably observe it: with the
+    // atomic alone, the increment and notify could land between a waiter's check of the generation (under the
+    // mutex) and its sleep, and the waiter (whose wait has no timeout) never woke.
+    bool notify;
+    {
+        std::lock_guard lock(g_dispatcherMutex);
+        g_dispatcherGeneration.fetch_add(1, std::memory_order_release);
+        notify = !g_fastEvents || g_dispatcherWaiters != 0;
+    }
+
+    if (notify)
+        g_dispatcherCv.notify_all();
 }
 
 static void WaitDispatcherGeneration(uint32_t generation)
 {
     std::unique_lock lock(g_dispatcherMutex);
+    g_dispatcherWaiters++;
     g_dispatcherCv.wait(lock, [&]
     {
         return g_dispatcherGeneration.load(std::memory_order_acquire) != generation;
     });
+    g_dispatcherWaiters--;
 }
 
 struct Event final : KernelObject, HostObject<XKEVENT>
@@ -50,19 +108,35 @@ struct Event final : KernelObject, HostObject<XKEVENT>
     mutable std::mutex mutex;
     std::condition_variable cv;
     bool signaled;
+    uint32_t waiters = 0; // Under mutex (SwitchFastEvents).
+    uint32_t dispatcherWaiters = 0; // Under mutex (SwitchTargetedDispatcherWakeups).
+    std::atomic<bool> signaledHint; // SwitchEventSpin: `signaled`, written with it under the mutex, read without it.
 
     Event(XKEVENT* header)
-        : manualReset(!header->Type), signaled(!!header->SignalState)
+        : manualReset(!header->Type), signaled(!!header->SignalState), signaledHint(!!header->SignalState)
     {
     }
 
     Event(bool manualReset, bool initialState)
-        : manualReset(manualReset), signaled(initialState)
+        : manualReset(manualReset), signaled(initialState), signaledHint(initialState)
     {
+    }
+
+    void SetSignaled(bool value) // Under mutex.
+    {
+        signaled = value;
+        signaledHint.store(value, std::memory_order_release);
     }
 
     uint32_t Wait(uint32_t timeout) override
     {
+#if defined(__SWITCH__)
+        if (g_eventSpin && timeout == INFINITE)
+        {
+            for (uint32_t i = 0; i < 512 && !signaledHint.load(std::memory_order_acquire); i++)
+                __asm__ __volatile__("yield");
+        }
+#endif
         std::unique_lock lock(mutex);
 
         if (timeout == 0)
@@ -71,14 +145,16 @@ struct Event final : KernelObject, HostObject<XKEVENT>
                 return STATUS_TIMEOUT;
 
             if (!manualReset)
-                signaled = false;
+                SetSignaled(false);
         }
         else if (timeout == INFINITE)
         {
+            waiters++;
             cv.wait(lock, [&] { return signaled; });
+            waiters--;
 
             if (!manualReset)
-                signaled = false;
+                SetSignaled(false);
         }
         else
         {
@@ -97,18 +173,26 @@ struct Event final : KernelObject, HostObject<XKEVENT>
     bool Set()
     {
         bool previousState;
+        bool notify;
+        bool notifyDispatcher;
         {
             std::lock_guard lock(mutex);
             previousState = signaled;
-            signaled = true;
+            SetSignaled(true);
+            notify = !g_fastEvents || waiters != 0;
+            notifyDispatcher = !g_targetedDispatcherWakeups || dispatcherWaiters != 0;
         }
 
-        if (manualReset)
-            cv.notify_all();
-        else
-            cv.notify_one();
+        if (notify)
+        {
+            if (manualReset)
+                cv.notify_all();
+            else
+                cv.notify_one();
+        }
 
-        NotifyDispatcherWaiters();
+        if (notifyDispatcher)
+            NotifyDispatcherWaiters();
 
         return previousState;
     }
@@ -117,7 +201,7 @@ struct Event final : KernelObject, HostObject<XKEVENT>
     {
         std::lock_guard lock(mutex);
         const bool previousState = signaled;
-        signaled = false;
+        SetSignaled(false);
         return previousState;
     }
 };
@@ -128,6 +212,8 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
     std::condition_variable cv;
     uint32_t count;
     uint32_t maximumCount;
+    uint32_t waiters = 0; // Under mutex (SwitchFastEvents, SwitchSemaphoreWakeCount).
+    uint32_t dispatcherWaiters = 0; // Under mutex (SwitchTargetedDispatcherWakeups).
 
     Semaphore(XKSEMAPHORE* semaphore)
         : count(semaphore->Header.SignalState), maximumCount(semaphore->Limit)
@@ -155,7 +241,9 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
         }
         else if (timeout == INFINITE)
         {
+            waiters++;
             cv.wait(lock, [&] { return count != 0; });
+            waiters--;
             --count;
 
             return STATUS_SUCCESS;
@@ -181,6 +269,8 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
 
     void Release(uint32_t releaseCount, uint32_t* previousCount)
     {
+        uint32_t waitersNow;
+        bool notifyDispatcher;
         {
             std::lock_guard lock(mutex);
             assert(releaseCount <= maximumCount - count);
@@ -189,10 +279,30 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
                 *previousCount = count;
 
             count += releaseCount;
+            waitersNow = waiters;
+            notifyDispatcher = !g_targetedDispatcherWakeups || dispatcherWaiters != 0;
         }
 
-        cv.notify_all();
-        NotifyDispatcherWaiters();
+        if (!g_fastEvents || waitersNow != 0)
+        {
+            // SwitchSemaphoreWakeCount: each unit wakes one waiter. A counted waiter is asleep in the wait or will
+            // check the count under the mutex before it sleeps, and a woken one takes its unit under the mutex; a
+            // notify that finds nobody asleep is not needed (everyone counted is about to look), and the waiters
+            // left asleep would have found the count at 0 after the others. Which waiters win was always up to
+            // the scheduler.
+            if (g_semaphoreWakeCount && releaseCount < waitersNow)
+            {
+                for (uint32_t i = 0; i < releaseCount; i++)
+                    cv.notify_one();
+            }
+            else
+            {
+                cv.notify_all();
+            }
+        }
+
+        if (notifyDispatcher)
+            NotifyDispatcherWaiters();
     }
 };
 
@@ -795,6 +905,69 @@ uint32_t KeSetAffinityThread(uint32_t Thread, uint32_t Affinity, be<uint32_t>* l
     return 0;
 }
 
+#if defined(__SWITCH__)
+// [Switch] SwitchSleepingGuestLocks. A guest thread that finds a critical section taken retried with
+// std::this_thread::yield(), and a guest spin lock the same way. On Horizon a yield only lets threads of the same
+// priority run on that core: a waiter above the owner's priority (the 0x2B audio pump, which runs the game's mixer,
+// against the 0x3B game threads) spun, one system call per attempt, until the owner ran elsewhere.
+// With this on, a critical section waiter sleeps on the owner word (svcWaitForAddress, woken by the final leave,
+// with a 1 ms safety timeout that turns a lost wake-up into a retry), and a spin lock waiter sleeps 10 µs, which
+// lets any thread run. The acquiring compare-and-swap, the owner and recursion values are the same.
+bool g_sleepingGuestLocks = false;
+
+// SwitchFastCriticalSections (only with SwitchSleepingGuestLocks). The final leave then wakes a waiter with a
+// system call (svcSignalToAddress) whether anyone waits or not, and the game takes critical sections thousands of
+// times a frame. With this on, a thread about to wait counts itself in the critical section's LockCount (a field
+// the guest never reads; RtlInitializeCriticalSection* sets it to -1, so -1 means nobody waits) and the leave only
+// makes the call when someone does. The waiter counts itself before it compares the owner (the kernel's
+// wait-if-equal), the leaver clears the owner before it reads the count, with full barriers in between: a leaver
+// that sees no waiter cleared the owner before the waiter compared it, and the waiter does not sleep. A critical
+// section whose LockCount did not start at -1 just keeps getting the call; the 1 ms timeout bounds any miss.
+bool g_fastCriticalSections = false;
+
+// SwitchLeanCriticalSectionLeave (with SwitchFastCriticalSections; UnleashedRecomp-NX round 12): the final leave
+// clears the owner with a sequentially consistent store and then reads the waiter count with a sequentially consistent
+// load. Those two are already ordered (the single total order of seq_cst operations; on AArch64 an STLR and a later
+// LDAR are never reordered), so the full fence between them, a DMB on every final leave, adds nothing. The waiter's
+// side keeps its fence: the kernel's compare is not a C++ load.
+bool g_leanCriticalSectionLeave = false;
+
+// SwitchGuestSpinBeforeSleep. A spin lock's owner that runs on another core usually holds it for a short while, so
+// the waiter watches the lock word (reads only) for up to ~2 µs before its yield or sleep, and tries again as soon
+// as it clears. The acquisition is still the same compare-and-swap.
+bool g_guestSpinBeforeSleep = false;
+
+// SwitchCriticalSectionSpin (UnleashedRecomp-NX round 14; with SwitchSleepingGuestLocks): a critical section held by
+// another thread is watched (reads only) for ~2 us before the kernel wait, as the guest spin locks do: most are held
+// for less than that (the profile had the game thread waiting in the kernel for the sound thread's critical sections,
+// each wait a system call, and each release then another one to wake it). The acquisition is the same compare-and-swap.
+bool g_criticalSectionSpin = false;
+static bool SpinUntilFree(std::atomic_ref<uint32_t>& lock);
+
+// 32-bit wait on a guest word through Horizon's address arbiter: returns when the word no longer holds `undesired`,
+// when another thread signals the address, or after the safety timeout.
+static void SwitchAtomicWait32(void* address, uint32_t undesired)
+{
+    constexpr uint32_t ARBITRATION_WAIT_IF_EQUAL = 2;
+    constexpr int64_t SAFETY_TIMEOUT_NS = 1'000'000; // 1 ms
+    constexpr uint32_t RESULT_TIMED_OUT = 0xEA01;
+    constexpr uint32_t RESULT_INVALID_STATE = 0xFA01; // The word did not hold `undesired`.
+
+    const uint32_t result = svcWaitForAddress(address, ARBITRATION_WAIT_IF_EQUAL,
+        static_cast<int64_t>(static_cast<int32_t>(undesired)), SAFETY_TIMEOUT_NS);
+
+    // Any other failure returns at once: yield as before rather than retry in a tight loop.
+    if (result != 0 && result != RESULT_TIMED_OUT && result != RESULT_INVALID_STATE)
+        std::this_thread::yield();
+}
+
+static void SwitchAtomicNotifyOne32(void* address)
+{
+    constexpr uint32_t SIGNAL_TYPE_SIGNAL = 0;
+    svcSignalToAddress(address, SIGNAL_TYPE_SIGNAL, 0, 1);
+}
+#endif
+
 void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
 {
     // printf("RtlLeaveCriticalSection");
@@ -805,14 +978,43 @@ void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
 
     std::atomic_ref owningThread(cs->OwningThread);
     owningThread.store(0);
-#if !defined(__SWITCH__)
+#if defined(__SWITCH__)
+    if (g_sleepingGuestLocks)
+    {
+        if (g_fastCriticalSections)
+        {
+            if (!g_leanCriticalSectionLeave)
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (std::atomic_ref(cs->LockCount).load(std::memory_order_seq_cst) == -1)
+                return;
+        }
+
+        SwitchAtomicNotifyOne32(&cs->OwningThread);
+    }
+#else
     owningThread.notify_one();
 #endif
 }
 
+#if defined(__SWITCH__)
+// [Switch] The calling thread's id (its r13) from the caller's own context (the hooks at the end of this file)
+// instead of g_ppcContext, a thread-local variable whose every read is a call (-mtp=soft); the game enters critical
+// sections thousands of times a frame. The same value: g_ppcContext is that context (GuestThreadContext and
+// GuestToHostFunction set it to the context they run the guest code on, and r13 is copied into nested contexts).
+static void RtlEnterCriticalSectionAs(XRTL_CRITICAL_SECTION* cs, uint32_t thisThread);
+
+void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
+{
+    RtlEnterCriticalSectionAs(cs, g_ppcContext->r13.u32);
+}
+
+static void RtlEnterCriticalSectionAs(XRTL_CRITICAL_SECTION* cs, uint32_t thisThread)
+{
+#else
 void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
 {
     uint32_t thisThread = g_ppcContext->r13.u32;
+#endif
     // printf("RtlEnterCriticalSection %x %x %x %x\n", thisThread, cs->OwningThread, cs->LockCount, cs->RecursionCount);
     assert(thisThread != NULL);
 
@@ -830,6 +1032,30 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
 
         // printf("wait start %x\n", cs);
 #if defined(__SWITCH__)
+        if (g_sleepingGuestLocks)
+        {
+            // A weak compare-and-swap may fail with the section free (previousOwner 0): try again at once rather
+            // than sleep while the word holds 0.
+            if (previousOwner == 0)
+                continue;
+
+            if (g_criticalSectionSpin && SpinUntilFree(owningThread))
+                continue;
+
+            if (g_fastCriticalSections)
+            {
+                std::atomic_ref waiters(cs->LockCount);
+                waiters.fetch_add(1);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                SwitchAtomicWait32(&cs->OwningThread, previousOwner);
+                waiters.fetch_sub(1);
+                continue;
+            }
+
+            SwitchAtomicWait32(&cs->OwningThread, previousOwner);
+            continue;
+        }
+
         std::this_thread::yield();
 #else
         owningThread.wait(previousOwner);
@@ -891,6 +1117,57 @@ void KfReleaseSpinLock(uint32_t* spinLock)
     spinLockRef = 0;
 }
 
+#if defined(__SWITCH__)
+// Waits (reading only) for the lock word to become 0, for a bounded number of iterations: true if it did.
+static bool SpinUntilFree(std::atomic_ref<uint32_t>& lock)
+{
+    for (uint32_t i = 0; i < 512; i++)
+    {
+        if (lock.load(std::memory_order_relaxed) == 0)
+            return true;
+
+        __asm__ __volatile__("yield");
+    }
+
+    return false;
+}
+
+// KfAcquireSpinLock and KeAcquireSpinLockAtRaisedIrql. [Switch] The owner value (the caller's r13) is read once,
+// from the caller's context (the hooks at the end of this file), instead of from g_ppcContext on every attempt: a
+// thread-local read, which is a call with -mtp=soft. The same value, see RtlEnterCriticalSectionAs.
+static void AcquireGuestSpinLock(uint32_t* spinLock, uint32_t thisThread)
+{
+    std::atomic_ref spinLockRef(*spinLock);
+
+    while (true)
+    {
+        uint32_t expected = 0;
+        if (spinLockRef.compare_exchange_weak(expected, thisThread))
+            break;
+
+        if (g_guestSpinBeforeSleep && SpinUntilFree(spinLockRef))
+            continue;
+
+        if (g_sleepingGuestLocks)
+        {
+            // A weak compare-and-swap may fail with the lock free: try again at once.
+            if (expected == 0)
+                continue;
+
+            // yield() cannot run a lower-priority owner queued on this core; a real (bounded) sleep can.
+            svcSleepThread(10000);
+            continue;
+        }
+
+        std::this_thread::yield();
+    }
+}
+
+void KfAcquireSpinLock(uint32_t* spinLock)
+{
+    AcquireGuestSpinLock(spinLock, g_ppcContext->r13.u32);
+}
+#else
 void KfAcquireSpinLock(uint32_t* spinLock)
 {
     std::atomic_ref spinLockRef(*spinLock);
@@ -904,6 +1181,7 @@ void KfAcquireSpinLock(uint32_t* spinLock)
         std::this_thread::yield();
     }
 }
+#endif
 
 uint64_t KeQueryPerformanceFrequency()
 {
@@ -938,6 +1216,12 @@ void KeReleaseSpinLockFromRaisedIrql(uint32_t* spinLock)
     spinLockRef = 0;
 }
 
+#if defined(__SWITCH__)
+void KeAcquireSpinLockAtRaisedIrql(uint32_t* spinLock)
+{
+    AcquireGuestSpinLock(spinLock, g_ppcContext->r13.u32);
+}
+#else
 void KeAcquireSpinLockAtRaisedIrql(uint32_t* spinLock)
 {
     std::atomic_ref spinLockRef(*spinLock);
@@ -951,6 +1235,7 @@ void KeAcquireSpinLockAtRaisedIrql(uint32_t* spinLock)
         std::this_thread::yield();
     }
 }
+#endif
 
 uint32_t KiApcNormalRoutineNop()
 {
@@ -1166,6 +1451,43 @@ static std::vector<size_t> g_tlsFreeIndices;
 static size_t g_tlsNextIndex = 0;
 static RecompMutex g_tlsAllocationMutex;
 
+#if defined(__SWITCH__)
+// [Switch] SwitchFastGuestTls. KeTlsGetValue (1,967 call sites) and KeTlsSetValue went through a thread_local
+// std::vector: two thread-pointer calls (-mtp=soft: __aarch64_read_tp) per access, for its guard and its address.
+// The values stay exactly where they are, in that vector of the calling host thread; the hooks at the end of this
+// file only find it without a call: KeTlsGetValueRef leaves its address in t_guestTlsValues (a plain pointer, no
+// guard), which sits at a fixed distance from the thread pointer on every thread (local-exec TLS of the one
+// module), and the thread pointer is what __aarch64_read_tp reads (libnx keeps it at TLS + 0x1F8). A thread that
+// has no vector yet, or asks for an index past its end, takes the old path.
+bool g_fastGuestTls = false;
+static ptrdiff_t g_guestTlsOffset; // &t_guestTlsValues - thread pointer, the same on every thread.
+static thread_local std::vector<uint32_t>* t_guestTlsValues;
+
+static inline uint8_t* SwitchThreadPointer()
+{
+    uint8_t* tls;
+    __asm__("mrs %x0, tpidrro_el0" : "=r"(tls));
+    return *reinterpret_cast<uint8_t* const*>(tls + 0x1F8);
+}
+
+// Called once by SwitchPerfInitKernel on the main thread; false (and the fast path stays off) if the thread
+// pointer is not where __aarch64_read_tp finds it.
+bool SwitchInitFastGuestTls()
+{
+    uint8_t* threadPointer = SwitchThreadPointer();
+    if (threadPointer != static_cast<uint8_t*>(__aarch64_read_tp()))
+        return false;
+
+    g_guestTlsOffset = reinterpret_cast<uint8_t*>(&t_guestTlsValues) - threadPointer;
+    return true;
+}
+
+static inline std::vector<uint32_t>* FastGuestTlsValues()
+{
+    return *reinterpret_cast<std::vector<uint32_t>* const*>(SwitchThreadPointer() + g_guestTlsOffset);
+}
+#endif
+
 static uint32_t& KeTlsGetValueRef(size_t index)
 {
     // Having this a global thread_local variable
@@ -1176,6 +1498,14 @@ static uint32_t& KeTlsGetValueRef(size_t index)
     {
         s_tlsValues.resize(index + 1, 0);
     }
+
+#if defined(__SWITCH__)
+    if (g_fastGuestTls)
+    {
+        assert(reinterpret_cast<uint8_t*>(&t_guestTlsValues) == SwitchThreadPointer() + g_guestTlsOffset);
+        t_guestTlsValues = &s_tlsValues;
+    }
+#endif
 
     return s_tlsValues[index];
 }
@@ -1326,10 +1656,22 @@ void XexGetModuleHandle()
     LOG_UTILITY("!!! STUB !!!");
 }
 
+#if defined(__SWITCH__)
+static bool RtlTryEnterCriticalSectionAs(XRTL_CRITICAL_SECTION* cs, uint32_t thisThread);
+
 bool RtlTryEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
 {
-    // printf("RtlTryEnterCriticalSection\n");
+    return RtlTryEnterCriticalSectionAs(cs, g_ppcContext->r13.u32);
+}
+
+static bool RtlTryEnterCriticalSectionAs(XRTL_CRITICAL_SECTION* cs, uint32_t thisThread)
+{
+#else
+bool RtlTryEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
+{
     uint32_t thisThread = g_ppcContext->r13.u32;
+#endif
+    // printf("RtlTryEnterCriticalSection\n");
     assert(thisThread != NULL);
 
     std::atomic_ref owningThread(cs->OwningThread);
@@ -1716,6 +2058,57 @@ void NetDll_XNetGetTitleXnAddr()
     LOG_UTILITY("!!! STUB !!!");
 }
 
+// [Switch] SwitchTargetedDispatcherWakeups: a KeWaitForMultipleObjects call that may wait counts itself on each of its
+// objects, under the object's mutex, before it first looks at them, and uncounts itself on every return.
+struct DispatcherWaiterSlot
+{
+    std::mutex* mutex;
+    uint32_t* count;
+};
+
+struct DispatcherWaiterRegistration
+{
+    std::vector<DispatcherWaiterSlot>& slots;
+
+    DispatcherWaiterRegistration(std::vector<DispatcherWaiterSlot>& slots, uint32_t count, xpointer<XDISPATCHER_HEADER>* objects,
+        KernelObject* const* kernelObjects)
+        : slots(slots)
+    {
+        slots.clear();
+        if (!g_targetedDispatcherWakeups)
+            return;
+
+        for (uint32_t i = 0; i < count; i++)
+        {
+            if (objects[i].get()->Type == 5)
+            {
+                auto* semaphore = static_cast<Semaphore*>(kernelObjects[i]);
+                slots.push_back({ &semaphore->mutex, &semaphore->dispatcherWaiters });
+            }
+            else
+            {
+                auto* event = static_cast<Event*>(kernelObjects[i]);
+                slots.push_back({ &event->mutex, &event->dispatcherWaiters });
+            }
+        }
+
+        for (auto& slot : slots)
+        {
+            std::lock_guard lock(*slot.mutex);
+            ++*slot.count;
+        }
+    }
+
+    ~DispatcherWaiterRegistration()
+    {
+        for (auto& slot : slots)
+        {
+            std::lock_guard lock(*slot.mutex);
+            --*slot.count;
+        }
+    }
+};
+
 uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* Objects, uint32_t WaitType, uint32_t WaitReason, uint32_t WaitMode, uint32_t Alertable, be<int64_t>* Timeout)
 {
     const uint64_t timeout = GuestTimeoutToMilliseconds(Timeout);
@@ -1751,6 +2144,9 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
 
             s_objects[i] = queryObject(*object);
         }
+
+        thread_local std::vector<DispatcherWaiterSlot> s_slots;
+        DispatcherWaiterRegistration registration(s_slots, timeout != 0 ? Count : 0, Objects, s_objects.data());
 
         while (true)
         {
@@ -1793,6 +2189,9 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
 
             s_objects[i] = queryObject(*object);
         }
+
+        thread_local std::vector<DispatcherWaiterSlot> s_slots;
+        DispatcherWaiterRegistration registration(s_slots, timeout != 0 ? Count : 0, Objects, s_objects.data());
 
         while (true)
         {
@@ -1967,7 +2366,15 @@ GUEST_FUNCTION_HOOK(__imp__KeQueryBasePriorityThread, KeQueryBasePriorityThread)
 GUEST_FUNCTION_HOOK(__imp__NtSuspendThread, NtSuspendThread);
 GUEST_FUNCTION_HOOK(__imp__KeSetAffinityThread, KeSetAffinityThread);
 GUEST_FUNCTION_HOOK(__imp__RtlLeaveCriticalSection, RtlLeaveCriticalSection);
+#if defined(__SWITCH__)
+// The caller's r13 straight from its context (see RtlEnterCriticalSectionAs); the pointer as the hook would pass it.
+PPC_FUNC(__imp__RtlEnterCriticalSection)
+{
+    RtlEnterCriticalSectionAs(ctx.r3.u32 != 0 ? reinterpret_cast<XRTL_CRITICAL_SECTION*>(base + ctx.r3.u32) : nullptr, ctx.r13.u32);
+}
+#else
 GUEST_FUNCTION_HOOK(__imp__RtlEnterCriticalSection, RtlEnterCriticalSection);
+#endif
 GUEST_FUNCTION_HOOK(__imp__RtlImageXexHeaderField, RtlImageXexHeaderField);
 GUEST_FUNCTION_HOOK(__imp__HalReturnToFirmware, HalReturnToFirmware);
 GUEST_FUNCTION_HOOK(__imp__RtlFillMemoryUlong, RtlFillMemoryUlong);
@@ -1977,14 +2384,28 @@ GUEST_FUNCTION_HOOK(__imp__RtlCompareMemoryUlong, RtlCompareMemoryUlong);
 GUEST_FUNCTION_HOOK(__imp__RtlInitializeCriticalSection, RtlInitializeCriticalSection);
 GUEST_FUNCTION_HOOK(__imp__RtlRaiseException, RtlRaiseException_x);
 GUEST_FUNCTION_HOOK(__imp__KfReleaseSpinLock, KfReleaseSpinLock);
+#if defined(__SWITCH__)
+PPC_FUNC(__imp__KfAcquireSpinLock)
+{
+    AcquireGuestSpinLock(ctx.r3.u32 != 0 ? reinterpret_cast<uint32_t*>(base + ctx.r3.u32) : nullptr, ctx.r13.u32);
+}
+#else
 GUEST_FUNCTION_HOOK(__imp__KfAcquireSpinLock, KfAcquireSpinLock);
+#endif
 GUEST_FUNCTION_HOOK(__imp__KeQueryPerformanceFrequency, KeQueryPerformanceFrequency);
 GUEST_FUNCTION_HOOK(__imp__MmFreePhysicalMemory, MmFreePhysicalMemory);
 GUEST_FUNCTION_HOOK(__imp__VdPersistDisplay, VdPersistDisplay);
 GUEST_FUNCTION_HOOK(__imp__VdSwap, VdSwap);
 GUEST_FUNCTION_HOOK(__imp__VdGetSystemCommandBuffer, VdGetSystemCommandBuffer);
 GUEST_FUNCTION_HOOK(__imp__KeReleaseSpinLockFromRaisedIrql, KeReleaseSpinLockFromRaisedIrql);
+#if defined(__SWITCH__)
+PPC_FUNC(__imp__KeAcquireSpinLockAtRaisedIrql)
+{
+    AcquireGuestSpinLock(ctx.r3.u32 != 0 ? reinterpret_cast<uint32_t*>(base + ctx.r3.u32) : nullptr, ctx.r13.u32);
+}
+#else
 GUEST_FUNCTION_HOOK(__imp__KeAcquireSpinLockAtRaisedIrql, KeAcquireSpinLockAtRaisedIrql);
+#endif
 GUEST_FUNCTION_HOOK(__imp__KiApcNormalRoutineNop, KiApcNormalRoutineNop);
 GUEST_FUNCTION_HOOK(__imp__VdEnableRingBufferRPtrWriteBack, VdEnableRingBufferRPtrWriteBack);
 GUEST_FUNCTION_HOOK(__imp__VdInitializeRingBuffer, VdInitializeRingBuffer);
@@ -2017,8 +2438,45 @@ GUEST_FUNCTION_HOOK(__imp__KeUnlockL2, KeUnlockL2);
 GUEST_FUNCTION_HOOK(__imp__KeSetEvent, KeSetEvent);
 GUEST_FUNCTION_HOOK(__imp__KeResetEvent, KeResetEvent);
 GUEST_FUNCTION_HOOK(__imp__KeWaitForSingleObject, KeWaitForSingleObject);
+#if defined(__SWITCH__)
+// SwitchFastGuestTls (see KeTlsGetValueRef): the same vector element, found without a thread-local access.
+PPC_FUNC(__imp__KeTlsGetValue)
+{
+    const uint32_t index = ctx.r3.u32;
+    if (g_fastGuestTls)
+    {
+        const std::vector<uint32_t>* values = FastGuestTlsValues();
+        if (values != nullptr && index < values->size())
+        {
+            ctx.r3.u64 = (*values)[index];
+            return;
+        }
+    }
+
+    ctx.r3.u64 = KeTlsGetValue(index);
+}
+
+PPC_FUNC(__imp__KeTlsSetValue)
+{
+    const uint32_t index = ctx.r3.u32;
+    const uint32_t value = ctx.r4.u32;
+    if (g_fastGuestTls)
+    {
+        std::vector<uint32_t>* values = FastGuestTlsValues();
+        if (values != nullptr && index < values->size())
+        {
+            (*values)[index] = value;
+            ctx.r3.u64 = TRUE;
+            return;
+        }
+    }
+
+    ctx.r3.u64 = KeTlsSetValue(index, value);
+}
+#else
 GUEST_FUNCTION_HOOK(__imp__KeTlsGetValue, KeTlsGetValue);
 GUEST_FUNCTION_HOOK(__imp__KeTlsSetValue, KeTlsSetValue);
+#endif
 GUEST_FUNCTION_HOOK(__imp__KeTlsAlloc, KeTlsAlloc);
 GUEST_FUNCTION_HOOK(__imp__KeTlsFree, KeTlsFree);
 GUEST_FUNCTION_HOOK(__imp__XMsgInProcessCall, XMsgInProcessCall);
@@ -2042,7 +2500,15 @@ GUEST_FUNCTION_HOOK(__imp__XamInputGetCapabilities, XamInputGetCapabilities);
 GUEST_FUNCTION_HOOK(__imp__XamInputGetState, XamInputGetState);
 GUEST_FUNCTION_HOOK(__imp__XamInputSetState, XamInputSetState);
 GUEST_FUNCTION_HOOK(__imp__XexGetModuleHandle, XexGetModuleHandle);
+#if defined(__SWITCH__)
+PPC_FUNC(__imp__RtlTryEnterCriticalSection)
+{
+    ctx.r3.u64 = RtlTryEnterCriticalSectionAs(ctx.r3.u32 != 0 ? reinterpret_cast<XRTL_CRITICAL_SECTION*>(base + ctx.r3.u32) : nullptr,
+        ctx.r13.u32) ? 1 : 0;
+}
+#else
 GUEST_FUNCTION_HOOK(__imp__RtlTryEnterCriticalSection, RtlTryEnterCriticalSection);
+#endif
 GUEST_FUNCTION_HOOK(__imp__RtlInitializeCriticalSectionAndSpinCount, RtlInitializeCriticalSectionAndSpinCount);
 GUEST_FUNCTION_HOOK(__imp__XeCryptBnQwBeSigVerify, XeCryptBnQwBeSigVerify);
 GUEST_FUNCTION_HOOK(__imp__XeKeysGetKey, XeKeysGetKey);

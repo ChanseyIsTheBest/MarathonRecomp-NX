@@ -2,6 +2,7 @@
 #include <hid/hid.h>
 #include <kernel/xdm.h>
 #include <os/logger.h>
+#include <apu/audio_switch.h>
 
 #include <algorithm>
 #include <cstring>
@@ -17,6 +18,61 @@ namespace
     HidNpadStyleTag g_vibrationStyle = static_cast<HidNpadStyleTag>(0);
     int g_vibrationHandleCount = 0;
     bool g_vibrationInitialized = false;
+
+    // [Switch] SwitchVibrationDedupe: what was last sent, to which devices, with which controllers connected.
+    // hidSendVibrationValues is an IPC to the hid service, and the game sets its rumble on every
+    // XamInputSetState, nearly always to the value it already has. The hid service keeps a vibration device
+    // playing the last value it was sent until it is sent another, so sending the same values to the same
+    // devices again changes nothing: the controllers get the same sequence of distinct values. Any change of
+    // devices or connected controllers sends again, and so does the same value after VIBRATION_RESEND_NS, so
+    // that a reset the game cannot see (a controller reconnected, the console asleep) lasts at most that long.
+    constexpr uint64_t VIBRATION_RESEND_NS = 250'000'000;
+    HidVibrationDeviceHandle g_sentVibrationHandles[2]{};
+    HidVibrationValue g_sentVibrationValues[2]{};
+    int g_sentVibrationCount = 0;
+    uint32_t g_sentVibrationStyleSet = 0;
+    uint8_t g_sentVibrationActiveIds = 0;
+    bool g_sentVibrationActiveHandheld = false;
+    uint64_t g_sentVibrationTick = 0;
+    bool g_sentVibrationValid = false;
+
+    void SendVibrationValues(const HidVibrationValue* values)
+    {
+        const int count = g_vibrationHandleCount;
+        const size_t handlesSize = sizeof(HidVibrationDeviceHandle) * size_t(count);
+        const size_t valuesSize = sizeof(HidVibrationValue) * size_t(count);
+
+        if (!g_switchVibrationDedupe)
+        {
+            hidSendVibrationValues(g_vibrationHandles, values, count);
+            return;
+        }
+
+        const uint64_t now = armGetSystemTick();
+        if (g_sentVibrationValid &&
+            g_sentVibrationCount == count &&
+            g_sentVibrationStyleSet == g_pad.style_set &&
+            g_sentVibrationActiveIds == g_pad.active_id_mask &&
+            g_sentVibrationActiveHandheld == g_pad.active_handheld &&
+            now - g_sentVibrationTick < armNsToTicks(VIBRATION_RESEND_NS) &&
+            std::memcmp(g_sentVibrationHandles, g_vibrationHandles, handlesSize) == 0 &&
+            std::memcmp(g_sentVibrationValues, values, valuesSize) == 0)
+        {
+            return;
+        }
+
+        const Result rc = hidSendVibrationValues(g_vibrationHandles, values, count);
+
+        // Only a send that reached the service is remembered; after a failure the next call sends again.
+        g_sentVibrationValid = R_SUCCEEDED(rc);
+        g_sentVibrationCount = count;
+        g_sentVibrationStyleSet = g_pad.style_set;
+        g_sentVibrationActiveIds = g_pad.active_id_mask;
+        g_sentVibrationActiveHandheld = g_pad.active_handheld;
+        g_sentVibrationTick = now;
+        std::memcpy(g_sentVibrationHandles, g_vibrationHandles, handlesSize);
+        std::memcpy(g_sentVibrationValues, values, valuesSize);
+    }
 
     int16_t ScaleStickAxis(s32 value)
     {
@@ -100,6 +156,9 @@ namespace
             return true;
         }
 
+        // New devices (or none): whatever is sent next goes out.
+        g_sentVibrationValid = false;
+
         if (R_FAILED(hidInitializeVibrationDevices(g_vibrationHandles, handleCount, id, style)))
         {
             g_vibrationInitialized = false;
@@ -167,7 +226,7 @@ namespace
             values[i].freq_high = 320.0f;
         }
 
-        hidSendVibrationValues(g_vibrationHandles, values, g_vibrationHandleCount);
+        SendVibrationValues(values);
     }
 }
 
@@ -219,7 +278,11 @@ uint32_t hid::SetState(uint32_t dwUserIndex, XAMINPUT_VIBRATION* pVibration)
     UpdateGamepadState();
 
     if (!padIsConnected(&g_pad))
+    {
+        // Whatever controller comes back gets the next values, even unchanged ones.
+        g_sentVibrationValid = false;
         return ERROR_DEVICE_NOT_CONNECTED;
+    }
 
     g_vibration = *pVibration;
 
@@ -244,7 +307,7 @@ uint32_t hid::SetState(uint32_t dwUserIndex, XAMINPUT_VIBRATION* pVibration)
         values[i].freq_high = 320.0f;
     }
 
-    hidSendVibrationValues(g_vibrationHandles, values, g_vibrationHandleCount);
+    SendVibrationValues(values);
     return ERROR_SUCCESS;
 }
 

@@ -182,6 +182,24 @@ struct GuestTexture : GuestBaseTexture
     std::vector<std::unique_ptr<RenderTextureView>> framebufferViews;
     std::unique_ptr<GuestTexture> patchedTexture;
     struct GuestSurface* sourceSurface = nullptr;
+#if defined(__SWITCH__)
+    // [Switch] SwitchResolveHandOver: how CreateTexture made the image and its view, so that the image of a surface
+    // resolved into this texture can become this texture's image instead of being copied into it (gpu/video.cpp,
+    // HandOverSurfaceImage). hadSurfaceImage: the texture owns an image that was a surface's (cached framebuffers may
+    // name it).
+    RenderTextureViewDesc viewDesc{};
+    bool handOverCapable = false;
+    bool hadSurfaceImage = false;
+    // [Switch] SwitchKeepResolvesPending: the pending copy from sourceSurface was kept over a Present, where the port
+    // used to make it.
+    bool pendingCarried = false;
+    // [Switch] The pending copy from sourceSurface is one the port used to make already (SwitchLazyResolves,
+    // SwitchSkipNoOpDraws, SwitchReadOnlyDepthSampling): it is made before anything could see the difference.
+    bool copyOwed = false;
+    // [Switch] The game released this texture while a colour copy the port still had pending was waiting for it: it stays
+    // listed until the next Present, whose rule for depth copies depends on it (ForgetPendingResolves).
+    bool released = false;
+#endif
 };
 
 struct GuestLockedRect
@@ -238,6 +256,25 @@ struct GuestSurface : GuestBaseTexture
     RenderSampleCounts sampleCount = RenderSampleCount::COUNT_1;
     ankerl::unordered_dense::map<GuestTexture*, uint32_t> destinationTextures;
     bool wasCached = false;
+#if defined(__SWITCH__)
+    // [Switch] SwitchReadOnlyDepthSampling (gpu/video.cpp): framebuffers with this depth surface as a read-only
+    // attachment (keyed by colour image, like `framebuffers`), and views of its image made like the views of the
+    // depth textures resolved from it, sampled while it is one.
+    ankerl::unordered_dense::map<const RenderTexture*, std::unique_ptr<RenderFramebuffer>> readOnlyFramebuffers;
+    struct DepthReadView
+    {
+        RenderComponentMapping componentMapping;
+        std::unique_ptr<RenderTextureView> view;
+        uint32_t descriptorIndex = 0;
+    };
+    std::vector<DepthReadView> depthReadViews;
+    // [Switch] SwitchUniformStencilClears: every stencil texel of the image holds stencilValue (set by a clear of
+    // the whole stencil, dropped by anything that may write it).
+    bool stencilKnown = false;
+    uint8_t stencilValue = 0;
+    // [Switch] The game released this (uncached) surface while textures still had pending copies from it.
+    bool released = false;
+#endif
 };
 
 enum GuestDeclType
@@ -328,6 +365,15 @@ struct GuestShader : GuestResource
 #endif
 #ifdef ASYNC_PSO_DEBUG
     const char* name = "<unknown>";
+#endif
+#if defined(__SWITCH__)
+    // [Switch] What the renderer found in the SPIR-V the shader was created from (gpu/video.cpp, GetOrLinkShader and
+    // the hand-written shaders). Written once, before the first pipeline that uses the shader is created; until
+    // then (and for shaders never analysed) the values that disable the optimisations: constants read through the
+    // pointers, the fragment stage kept, every vertex output read.
+    std::atomic<bool> constantsThroughUbo{ false };
+    std::atomic<bool> removableInDepthOnlyPass{ false };
+    std::atomic<uint32_t> inputLocationsRead{ ~0u };
 #endif
 };
 
@@ -469,6 +515,100 @@ enum GuestTextureAddress
 };
 
 inline bool g_needsResize;
+
+#if defined(__SWITCH__)
+// [Switch] Renderer options (keys in user/switch/config_renderer.inl), read once by SwitchPerfInitRenderer
+// (os/switch/perf/renderer_switch.cpp) right after the configuration is loaded, before the renderer starts.
+// Hot paths read these, never Config. All false (the unoptimised behaviour) until then.
+struct SwitchRendererOptions
+{
+    bool sparseConstantCopies;
+    bool compactTextureHeap;
+    bool singleCopyTriangle;
+    bool hostThreadCores;
+    bool pipelineLookupCache;
+    bool samplerCache;
+    bool frameLimiterSleep;
+    bool surveyPlainStore;
+    bool gammaPushConstants;
+    bool queryResetPerQuery;
+
+    // Stage 2: hand-over of render commands from the D3D thread to the render thread (gpu/video.cpp).
+    bool batchRenderCommands;
+    bool batchSeveralDraws;
+    bool largerCommandBatches;
+    bool renderQueueToken;
+    bool zeroCopyBatches;
+    bool idleRenderThreadBatches;
+    bool skipRedundantRenderStates;
+    bool skipRedundantSamplerStates;
+    bool presentOnRenderThread;
+    bool presentWithoutRecordWait; // only with presentOnRenderThread
+    bool deferredBufferUnlocks;
+
+    // Stage 3: pipelines and shader constants (gpu/video.cpp).
+    bool pipelineCache;
+    bool pipelineCacheSaveDuringPlay;
+    bool depthOnlyWithoutPixelShader;
+    bool trimPixelOutputs;
+    bool trimVertexOutputs;
+    bool constantsUbo;
+    bool trimConstantUploads;
+    bool skipUnusedPixelConstants;
+    bool copyKeepsVertexConstants;
+
+    // Stage 4: resolves, clears, barriers and framebuffers (gpu/video.cpp).
+    bool resolveStats;
+    bool preciseBarriers;
+    bool preciseSurveyBarriers; // only with preciseBarriers
+    bool zcull;
+    bool skipNoOpDraws;
+    bool eagerSampleTransitions;
+    bool lazyResolves;
+    bool resolveHandOver;
+    bool keepResolvesPending;
+    bool coverageHandOver;
+    bool exactCoverage;
+    bool skipOverwrittenClears;
+    bool skipRestoreDraws;
+    bool depthArrayTexturesD32;
+    bool depthTexturesD32;
+    bool cascadeAdoption;       // perf7: the shadow cascades drawn into the cascaded shadow map's next image
+    bool stableFramebuffers;
+    bool readOnlyDepthSampling;
+    bool uniformStencilClears;
+
+    // Stage 5: the specialization bits and shared constant tables of the translated shaders (gpu/video.cpp).
+    bool textureSizeConstants;
+    bool verifyTextureSizes;
+    bool shadowGather;
+    bool verifyShadowGather;
+    bool shadowGatherSpecialization;
+    bool alphaTestEarlyOut;
+    bool alphaTestSink;
+    bool skipTransparentPixels;
+    bool vertexSwapSpecialization;
+    bool clipDistanceSpecialization;
+    bool surveySlots;
+    bool indexedConstantsFromMemory;
+
+    // Stage 6: measurement (gpu/video.cpp); nothing drawn changes.
+    bool gpuPassProfiler; // also on with gpuDrawProfiler and gpuSlowFrameMs
+    uint32_t gpuSlowFrameMs; // SwitchGpuSlowFrameMs; 0 = off
+    bool gpuDrawProfiler;
+    bool frameLog;
+    bool showProfiler;
+};
+
+extern SwitchRendererOptions g_switchRenderer;
+
+// Set (release) once g_switchRenderer holds the configuration. The render thread starts during static
+// initialisation, before the configuration is loaded, and checks this before its one-time setup.
+extern std::atomic<bool> g_switchRendererConfigured;
+
+// Makes `core` the calling thread's preferred core; it may still run on every core of the process.
+void SwitchRendererSetThreadCore(int32_t core);
+#endif
 
 extern std::unique_ptr<GuestTexture> LoadTexture(const uint8_t* data, size_t dataSize, RenderComponentMapping componentMapping = RenderComponentMapping());
 

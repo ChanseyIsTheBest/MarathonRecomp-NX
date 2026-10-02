@@ -2,6 +2,12 @@
 # Packages the built Switch ELF into an NRO: nacptool (version from
 # res/version.txt) + strip + elf2nro (with the app icon). Safe to re-run.
 set -euo pipefail
+# Git Bash exports DEVKITPRO=/opt/devkitpro even where that folder does not exist.
+if [ -z "${DEVKITPRO:-}" ] || [ ! -d "$DEVKITPRO" ]; then
+  for devkitpro_candidate in /opt/devkitpro /c/devkitPro; do
+    if [ -d "$devkitpro_candidate" ]; then DEVKITPRO="$devkitpro_candidate"; break; fi
+  done
+fi
 : "${DEVKITPRO:=/opt/devkitpro}"
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root_dir"

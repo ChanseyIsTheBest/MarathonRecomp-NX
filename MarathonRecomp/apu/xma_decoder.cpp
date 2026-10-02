@@ -10,9 +10,12 @@
 // Almost all decoding code is from Xenia Canary, so leave the copyright here
 
 #include "xma_decoder.h"
+#include <atomic>
 #if defined(__SWITCH__)
 #include <chrono>
 #include <os/logger.h>
+#include <apu/audio_switch.h>
+#include <os/switch_cpu_profiler.h>
 extern "C" void SwitchSetCurrentThreadPriority(int priority);
 #endif
 
@@ -30,6 +33,20 @@ constexpr uint32_t kBitsPerPacket = kBytesPerPacket * 8;
 constexpr uint32_t kMaxFrameLength = 0x7FFF;
 constexpr uint32_t kBitsPerFrameHeader = 15;
 constexpr uint32_t kMaxFrameSizeinBits = 0x4000 - kBitsPerPacketHeader;
+
+// The decoded PCM is published by the offset that exposes it: the decoder stores outputBufferWriteOffset (and a
+// full ring's outputBufferValid = 0) with release after writing the samples, and the guest-side calls load them
+// with acquire before handing out pointers to the samples. Same values in the same order as plain accesses. The
+// decoder and the guest's threads can run on different cores (libnx gives every thread the process's core mask, with
+// or without [Switch] SwitchAudioThreadCores), and this keeps a reader from seeing an offset before the samples it
+// covers.
+static inline uint32_t LoadAcquire(uint32_t &value) {
+    return std::atomic_ref<uint32_t>(value).load(std::memory_order_acquire);
+}
+
+static inline void StoreRelease(uint32_t &value, uint32_t newValue) {
+    std::atomic_ref<uint32_t>(value).store(newValue, std::memory_order_release);
+}
 
 uint32_t XMAPlaybackGetFrameOffsetFromPacketHeader(uint32_t header) {
     uint32_t result = 0;
@@ -496,10 +513,55 @@ void Consume(XmaPlaybackStream *playback) {
     playback->currentFrameRemainingSubframes -= subframesToWrite;
 }
 
+#if defined(__SWITCH__)
+// [Switch] SwitchXmaEventWait: whether a decode pass could change anything now. Caller holds the stream's mutex.
+// A pass writes only while the guest does not hold the modify lock and the ring is not marked full, when the
+// ring has room for its minimum (computed as the pass computes it) and there is input left or a decoded frame
+// still to copy out; otherwise it changes no state. A pass that started at wake generation `stalledGeneration`
+// and changed nothing (a malformed or incomplete packet) would change nothing again until something else
+// changes, which bumps the generation.
+static bool DecoderHasWork(XmaPlaybackStream *playback, bool stalled, uint32_t stalledGeneration) {
+    if (!playback->isRunning)
+        return true;
+
+    if (playback->isLocked.load() || !playback->outputBufferValid)
+        return false;
+
+    if (stalled && playback->decoderWakeGeneration == stalledGeneration)
+        return false;
+
+    if (!playback->IsAnyInputBufferValid() && playback->currentFrameRemainingSubframes == 0)
+        return false;
+
+    const size_t outputCapacity = playback->outputBufferBlockCount * kOutputBytesPerBlock;
+    if (outputCapacity == 0)
+        return false;
+
+    RingBuffer ring(nullptr, outputCapacity);
+    ring.set_read_offset(playback->outputBufferReadOffset * kOutputBytesPerBlock);
+    ring.set_write_offset(playback->outputBufferWriteOffset * kOutputBytesPerBlock);
+    return (int32_t)ring.write_count() / (int32_t)kOutputBytesPerBlock >= std::max<int32_t>(1, playback->subframes);
+}
+
+// Everything a pass can change that decides what the next pass does.
+static std::array<uint32_t, 8> DecoderPassState(const XmaPlaybackStream *playback) {
+    return { playback->inputBufferReadOffset, playback->currentFrameRemainingSubframes, playback->currentBuffer,
+        playback->inputBuffer1Valid, playback->inputBuffer2Valid, playback->outputBufferWriteOffset,
+        playback->outputBufferValid, playback->numLoops };
+}
+#endif
+
 void DecoderThreadFunc(XmaPlaybackStream *playback) {
 #if defined(__SWITCH__)
     // Audio-critical: preempt spinning guest threads (see runtime_switch.cpp).
     SwitchSetCurrentThreadPriority(0x2B);
+    // [Switch] SwitchAudioThreadCores: pinned to the audio pump's core, off the game's main core.
+    SwitchAudioSetCurrentThreadCore();
+    os::switch_cpu_profiler::RegisterCurrentThread("xma decoder");
+
+    // [Switch] SwitchXmaEventWait: the last pass changed nothing, and the wake generation it started at.
+    bool stalled = false;
+    uint32_t stalledGeneration = 0;
 #endif
     while (playback->isRunning) {
         std::unique_lock<std::mutex> lock(playback->mutex);
@@ -510,12 +572,25 @@ void DecoderThreadFunc(XmaPlaybackStream *playback) {
                    !playback->isLocked.load();
         };
 #if defined(__SWITCH__)
-        // Notify-driven wait, 2 ms liveness cap. No predicate on purpose: a
-        // predicate makes wait_for return instantly while there is decodable
-        // state, busy-spinning the decoder and starving the audio pump. The 2 ms
-        // timeout covers a dropped notify_one (a bare cv.wait would deadlock).
         (void)ready;
-        playback->cv.wait_for(lock, std::chrono::milliseconds(2));
+        if (g_switchXmaEventWait) {
+            // [Switch] SwitchXmaEventWait: sleep until a pass can make progress instead of waking 500 times a
+            // second. Every change that can allow one notifies (resume, submit, flush, destroy); the guest makes
+            // all the others while it holds the modify lock, and its resume notifies. The timeout only bounds a
+            // change made outside that protocol, which then gets the 2 ms poll's behaviour, later.
+            if (!DecoderHasWork(playback, stalled, stalledGeneration)) {
+                playback->decoderWaiting = true;
+                playback->decoderCv.wait_for(lock, std::chrono::milliseconds(20),
+                    [&] { return DecoderHasWork(playback, stalled, stalledGeneration); });
+                playback->decoderWaiting = false;
+            }
+        } else {
+            // Notify-driven wait, 2 ms liveness cap. No predicate on purpose: a
+            // predicate makes wait_for return instantly while there is decodable
+            // state, busy-spinning the decoder and starving the audio pump. The 2 ms
+            // timeout covers a dropped notify_one (a bare cv.wait would deadlock).
+            playback->cv.wait_for(lock, std::chrono::milliseconds(2));
+        }
 #else
         playback->cv.wait(lock, ready);
 #endif
@@ -526,6 +601,10 @@ void DecoderThreadFunc(XmaPlaybackStream *playback) {
         if (!playback->isRunning)
             break;
 
+#if defined(__SWITCH__)
+        const uint32_t passGeneration = playback->decoderWakeGeneration;
+        const auto passState = DecoderPassState(playback);
+#endif
         playback->decoderWorking.store(true, std::memory_order_release);
         lock.unlock();
 
@@ -552,6 +631,10 @@ void DecoderThreadFunc(XmaPlaybackStream *playback) {
             lock.lock();
             playback->decoderWorking.store(false, std::memory_order_release);
             playback->cv.notify_all();
+#if defined(__SWITCH__)
+            stalled = true;
+            stalledGeneration = passGeneration;
+#endif
             continue;
         }
 
@@ -576,20 +659,28 @@ void DecoderThreadFunc(XmaPlaybackStream *playback) {
             }
         }
 
-        playback->outputBufferWriteOffset = playback->outputRb.write_offset() / kOutputBytesPerBlock;
+        StoreRelease(playback->outputBufferWriteOffset, playback->outputRb.write_offset() / kOutputBytesPerBlock);
         playback->bAllowedToDecode = false;
 
         // Equal read/write offsets are ambiguous in this ring: they can mean
         // either empty or full. Only publish a full ring after Decode has
         // consumed every tracked free subframe block.
         if (playback->remainingSubframeBlocksInOutputBuffer == 0) {
-            playback->outputBufferValid = 0;
+            StoreRelease(playback->outputBufferValid, 0);
         }
 
         lock.lock();
         playback->decoderWorking.store(false, std::memory_order_release);
         playback->cv.notify_all();
+#if defined(__SWITCH__)
+        stalled = DecoderPassState(playback) == passState;
+        stalledGeneration = passGeneration;
+#endif
     }
+
+#if defined(__SWITCH__)
+    os::switch_cpu_profiler::UnregisterCurrentThread();
+#endif
 }
 
 uint32_t XMAPlaybackCreate(uint32_t streams, XMAPLAYBACKINIT *init, uint32_t flags, be<uint32_t> *outPlayback) {
@@ -673,6 +764,9 @@ uint32_t XMAPlaybackResumePlayback(XmaPlayback *playback) {
         std::lock_guard<std::mutex> lock(stream->mutex);
         stream->isLocked = false;
         stream->cv.notify_one();
+#if defined(__SWITCH__)
+        stream->NotifyDecoderLocked();
+#endif
     }
 
     return 0;
@@ -740,6 +834,9 @@ uint32_t XMAPlaybackSubmitData(XmaPlayback *playback, uint32_t stream, uint32_t 
 
     context->bAllowedToDecode = true;
     context->cv.notify_one();
+#if defined(__SWITCH__)
+    context->NotifyDecoderLocked();
+#endif
     return 0;
 }
 
@@ -751,11 +848,11 @@ uint32_t XMAPlaybackQueryAvailableData(XmaPlayback *playback, uint32_t stream) {
 
     uint32_t partialBytesRead = context->partialBytesRead;
     uint32_t writeBufferOffsetRead = context->outputBufferReadOffset & 0x1F;
-    uint32_t offsetWrite = context->outputBufferWriteOffset;
+    uint32_t offsetWrite = LoadAcquire(context->outputBufferWriteOffset);
     uint32_t sizeWrite = context->outputBufferBlockCount & 0x1F;
 
     uint32_t availableBytes = 0;
-    uint32_t isValidWrite = context->outputBufferValid;
+    uint32_t isValidWrite = LoadAcquire(context->outputBufferValid);
 
     if (partialBytesRead) {
         availableBytes = 256 - partialBytesRead;
@@ -793,11 +890,11 @@ uint32_t XMAPlaybackAccessDecodedData(XmaPlayback *playback, uint32_t stream, ui
     *data = (uint32_t *)__builtin_bswap32(addr);
 
     uint32_t writeBufferOffsetRead = context->outputBufferReadOffset & 0x1F;
-    uint32_t offsetWrite = context->outputBufferWriteOffset;
+    uint32_t offsetWrite = LoadAcquire(context->outputBufferWriteOffset);
     uint32_t sizeWrite = context->outputBufferBlockCount & 0x1F;
 
     uint32_t availableBytes = 0;
-    uint32_t isValidWrite = context->outputBufferValid;
+    uint32_t isValidWrite = LoadAcquire(context->outputBufferValid);
 
     if (partialBytesRead) {
         availableBytes = 256 - partialBytesRead;
@@ -872,9 +969,9 @@ uint32_t XMAPlaybackConsumeDecodedData(XmaPlayback *playback, uint32_t stream, u
 
     // Cap the returned contiguous range at the decoder's actual write offset.
     // Using the ring capacity here makes unwritten/stale blocks appear valid.
-    uint32_t writeSize = context->outputBufferWriteOffset;
+    uint32_t writeSize = LoadAcquire(context->outputBufferWriteOffset);
     if (writeSize <= writeIndex) {
-        if (writeSize < writeIndex || !context->outputBufferValid) {
+        if (writeSize < writeIndex || !LoadAcquire(context->outputBufferValid)) {
             availableBlocks = (context->outputBufferBlockCount & 0x1F) - writeIndex;
         }
     } else {
@@ -956,6 +1053,9 @@ uint32_t XMAPlaybackFlushData(XmaPlayback *playback, uint32_t streamIndex) {
     std::memset(g_memory.Translate(stream->outputBuffer), 0,
         stream->outputBufferBlockCount * kOutputBytesPerBlock);
     avcodec_flush_buffers(stream->codec_ctx);
+#if defined(__SWITCH__)
+    stream->NotifyDecoderLocked();
+#endif
 
     return 0;
 }

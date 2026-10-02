@@ -32,6 +32,13 @@ void GlobalMemoryStatusImpl(XLPMEMORYSTATUS lpMemoryStatus)
     lpMemoryStatus->dwAvailVirtual = 0x20000000;
 }
 
+#if defined(__SWITCH__)
+// [Switch] os/switch/perf/native_crt.cpp: memmove compiled into the app, which keeps x16 free for
+// os/switch/exception_switch.cpp to resume a fault on an uncommitted guest page; the prebuilt newlib memcpy/memmove
+// (one function) does not. The same bytes as that memcpy/memmove. (newlib's memset leaves x16 alone.)
+void* GuestMemmove(void* destination, const void* source, size_t size);
+#endif
+
 #ifndef _WIN32
 int memcpy_s(void* dest, size_t dest_size, const void* src, size_t count) {
     if (dest == nullptr || src == nullptr) {
@@ -41,19 +48,31 @@ int memcpy_s(void* dest, size_t dest_size, const void* src, size_t count) {
         return ERANGE;
     }
 
+#if defined(__SWITCH__)
+    GuestMemmove(dest, src, count);
+#else
     memcpy(dest, src, count);
+#endif
     return 0;
 }
 #endif
 
+#if defined(__SWITCH__)
+GUEST_FUNCTION_HOOK(sub_826DF680, GuestMemmove);
+#else
 GUEST_FUNCTION_HOOK(sub_826DF680, memcpy);
+#endif
 // GUEST_FUNCTION_HOOK(sub_831CCB98, memcpy);
 // GUEST_FUNCTION_HOOK(sub_831CEAE0, memcpy);
 // GUEST_FUNCTION_HOOK(sub_831CEE04, memcpy);
 // GUEST_FUNCTION_HOOK(sub_831CF2D0, memcpy);
 // GUEST_FUNCTION_HOOK(sub_831CF660, memcpy);
-// GUEST_FUNCTION_HOOK(sub_826DFAA0, memcpy);
+// GUEST_FUNCTION_HOOK(sub_826DFAA0, memcpy); // [Switch] os/switch/perf/native_crt.cpp: memcpy unless the ranges overlap
+#if defined(__SWITCH__)
+GUEST_FUNCTION_HOOK(sub_826DE940, GuestMemmove);
+#else
 GUEST_FUNCTION_HOOK(sub_826DE940, memmove);
+#endif
 GUEST_FUNCTION_HOOK(sub_826DFD40, memset);
 GUEST_FUNCTION_HOOK(sub_826DEA00, memcpy_s);
 // GUEST_FUNCTION_HOOK(sub_831CCAA0, memset);
@@ -67,6 +86,10 @@ GUEST_FUNCTION_STUB(sub_82537770);
 GUEST_FUNCTION_HOOK(sub_826FCE58, QueryPerformanceCounterImpl); // replaced
 GUEST_FUNCTION_HOOK(sub_826FC3C8, QueryPerformanceFrequencyImpl); // repalced
 GUEST_FUNCTION_HOOK(sub_826FD790, GetTickCountImpl); // replaced
+
+// [Switch] More guest functions replaced by native code, each behind a [Switch] key (user/switch/config_native.inl):
+// the RTTI functions, the D3D shader constant setters, CRT string routines and the archive loader's zlib inflate,
+// in os/switch/perf/native_*.cpp.
 
 // GUEST_FUNCTION_HOOK(sub_82BD4BC0, GlobalMemoryStatusImpl);
 

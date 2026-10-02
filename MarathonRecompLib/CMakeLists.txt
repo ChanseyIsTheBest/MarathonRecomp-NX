@@ -34,6 +34,48 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-frounding-math>)
 endif()
 
+if (MARATHON_RECOMP_SWITCH AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # The guest never sees the host's errno or floating-point exception flags (mffs returns only the
+    # rounding mode), so the recompiled code does not need to preserve them: -fno-math-errno turns sqrt()
+    # into a single fsqrt instead of a check plus a possible libm call per square root, and
+    # -fno-trapping-math lets GCC if-convert floating-point code (FP traps are disabled on the host anyway).
+    # Neither changes any value: rounding is still honoured (-frounding-math), and no fast-math
+    # reassociation is enabled. Under GCC's default contraction they could in principle change which
+    # separate multiplies and adds get fused; checked on all of ppc/ (fused instructions per function, with
+    # and without each flag): -fno-math-errno changes none, and the only difference -fno-trapping-math
+    # makes is a block it duplicates or merges, each copy with the same fused operation.
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:-fno-math-errno>
+        $<$<COMPILE_LANGUAGE:CXX>:-fno-trapping-math>
+    )
+
+    # AArch64 GCC keeps a frame pointer by default: every non-leaf recompiled function set up x29 and
+    # could not use it as a register. The guest registers live in the context, so the recompiled code is
+    # short of registers; it gets x29 back. Only here: the port's own code keeps frame pointers for crash
+    # backtraces (os/switch/exception_switch.cpp reloads x29 from the exception dump, it walks no chain).
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fomit-frame-pointer>)
+
+    # os/switch/exception_switch.cpp resumes an emulated guest access through x16 without restoring it, so no
+    # value may live in x16 across a guest load or store. Register allocation only.
+    if (MARATHON_RECOMP_SWITCH_FIXED_X16)
+        add_compile_options(-ffixed-x16)
+    endif()
+
+    # Opt-in exact FMA: the guest's own fused operations are explicit fma (PPC_EXPLICIT_FMA, root CMakeLists.txt);
+    # nothing else fuses. _ACTIVE: requested, not classic, and ppc/ has the explicit fma text.
+    if (MARATHON_RECOMP_SWITCH_EXACT_FMA_ACTIVE)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+    endif()
+
+    # Guest memory accesses of the recompiled code as plain instead of volatile accesses (ppc_context.h): the compiler
+    # may forward, pair and schedule them, while the loop barriers on backward branches keep wait loops re-reading
+    # memory and the guest's sync/lwsync/eieio stay fences. The app keeps volatile accesses. Not with the classic
+    # code generation, which has no loop barriers.
+    if (MARATHON_RECOMP_SWITCH_PLAIN_GUEST_MEMORY AND NOT MARATHON_RECOMP_SWITCH_CLASSIC_CODEGEN)
+        add_compile_definitions(PPC_PLAIN_GUEST_MEMORY)
+    endif()
+endif()
+
 if (MARATHON_RECOMP_SWITCH)
     set(MARATHON_RECOMP_HOST_TOOLS_DIR "${CMAKE_SOURCE_DIR}/build/host-tools" CACHE PATH "Directory containing host-side generation tools.")
     set(MARATHON_RECOMP_HOST_U8EXTRACT "${MARATHON_RECOMP_HOST_TOOLS_DIR}/tools/u8extract/u8extract${CMAKE_HOST_EXECUTABLE_SUFFIX}" CACHE FILEPATH "Host u8extract executable.")
@@ -70,7 +112,20 @@ set(MARATHON_RECOMP_PPC_RECOMPILED_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/ppc/ppc_recomp_shared.h"
 )
 
-foreach(i RANGE 0 145)
+set(MARATHON_RECOMP_PPC_RECOMP_FILE_COUNT 0)
+if (MARATHON_RECOMP_SWITCH AND MARATHON_RECOMP_SWITCH_USE_PREGENERATED_PPC)
+    # tools/build-switch.sh generates ppc/ before it configures: take as many files as XenonRecomp wrote
+    # (256 functions each, so the count follows the functions of Marathon.toml), in the usual order.
+    while (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ppc/ppc_recomp.${MARATHON_RECOMP_PPC_RECOMP_FILE_COUNT}.cpp")
+        math(EXPR MARATHON_RECOMP_PPC_RECOMP_FILE_COUNT "${MARATHON_RECOMP_PPC_RECOMP_FILE_COUNT} + 1")
+    endwhile()
+endif()
+if (MARATHON_RECOMP_PPC_RECOMP_FILE_COUNT EQUAL 0)
+    set(MARATHON_RECOMP_PPC_RECOMP_FILE_COUNT 146)
+endif()
+math(EXPR MARATHON_RECOMP_PPC_RECOMP_LAST_FILE "${MARATHON_RECOMP_PPC_RECOMP_FILE_COUNT} - 1")
+
+foreach(i RANGE 0 ${MARATHON_RECOMP_PPC_RECOMP_LAST_FILE})
     list(APPEND MARATHON_RECOMP_PPC_RECOMPILED_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/ppc/ppc_recomp.${i}.cpp")
 endforeach()
 
@@ -146,3 +201,8 @@ add_library(MarathonRecompLib
 target_include_directories(MarathonRecompLib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(MarathonRecompLib PRIVATE "${MARATHON_RECOMP_TOOLS_ROOT}/XenonRecomp/thirdparty/simde")
 target_precompile_headers(MarathonRecompLib PUBLIC "ppc/ppc_recomp_shared.h")
+
+if (MARATHON_RECOMP_SWITCH AND MARATHON_RECOMP_SWITCH_RECOMP_O2)
+    message(STATUS "Switch: -O2 for the recompiled code")
+    target_compile_options(MarathonRecompLib PRIVATE -O2)
+endif()

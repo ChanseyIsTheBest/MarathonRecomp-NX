@@ -11,6 +11,9 @@
 #include <ui/options_menu.h>
 #include <user/config.h>
 #include <app.h>
+#if defined(__SWITCH__)
+#include <os/switch/perf/native_hooks.h>
+#endif
 
 // #define CORNER_DEBUG
 
@@ -19,6 +22,11 @@ constexpr float CHEVRON_OUTRO_DURATION = 2.01666666666667f;
 
 static RecompMutex g_pathMutex;
 static std::map<const void*, XXH64_hash_t> g_paths{};
+
+#if defined(__SWITCH__)
+// [Switch] SwitchModifierCache (FindCsdModifier). Advanced, under g_pathMutex, whenever g_paths changes.
+static std::atomic<uint64_t> g_pathsGeneration{ 1 };
+#endif
 
 static std::optional<CsdModifier> g_sceneModifier{};
 static std::optional<CsdModifier> g_castNodeModifier{};
@@ -190,6 +198,9 @@ void EmplacePath(const void* key, const std::string_view& value)
 {
     std::lock_guard lock(g_pathMutex);
     g_paths.emplace(key, HashStr(value));
+#if defined(__SWITCH__)
+    g_pathsGeneration.fetch_add(1, std::memory_order_release);
+#endif
 }
 
 void TraverseCast(Chao::CSD::Scene* scene, uint32_t castNodeIndex, Chao::CSD::CastNode* castNode, uint32_t castIndex, const std::string& parentPath)
@@ -321,6 +332,9 @@ PPC_FUNC(sub_82656650)
         auto upper = g_paths.lower_bound(key + fileSize);
     
         g_paths.erase(lower, upper);
+#if defined(__SWITCH__)
+        g_pathsGeneration.fetch_add(1, std::memory_order_release);
+#endif
 
         LOGFN_UTILITY("CSD freed: 0x{:08X}", (uint64_t)key);
     }
@@ -2236,7 +2250,9 @@ const xxHashMap<CsdModifier> g_csdModifiers =
     { HashStr("sprite/windowtest/cursor"), { CSD_SCALE } },
 };
 
-std::optional<CsdModifier> FindCsdModifier(uint32_t data)
+// The entry of g_csdModifiers (constant, so its entries stay where they are) for the path of the CSD object at data,
+// or nullptr.
+static const CsdModifier* FindCsdModifierEntry(uint32_t data)
 {
     XXH64_hash_t path;
     {
@@ -2245,7 +2261,7 @@ std::optional<CsdModifier> FindCsdModifier(uint32_t data)
         auto findResult = g_paths.find(g_memory.Translate(data));
 
         if (findResult == g_paths.end())
-            return {};
+            return nullptr;
 
         path = findResult->second;
     }
@@ -2253,7 +2269,88 @@ std::optional<CsdModifier> FindCsdModifier(uint32_t data)
     auto findResult = g_csdModifiers.find(path);
 
     if (findResult != g_csdModifiers.end())
-        return findResult->second;
+        return &findResult->second;
+
+    return nullptr;
+}
+
+#if defined(__SWITCH__)
+// [Switch] SwitchModifierCache. The UI looks up the modifier of every scene, cast node and cast it draws, each time
+// through the lock and the ordered map of all loaded paths. The results are kept for the addresses seen last, tagged
+// with the generation of g_paths they were found in: any change of g_paths (a project loaded or freed) makes them all
+// stale. The generation is read before the lookup it tags, so a change during the lookup also leaves the entry stale.
+// The first thread to look a modifier up (the game's thread, which draws the UI) gets a table of its own outside TLS
+// (a thread-local access is a call with -mtp=soft); others keep a smaller one in TLS. Threads are told apart by their
+// TLS region (TPIDRRO_EL0), which every thread has its own of.
+struct CsdModifierCacheEntry
+{
+    uint64_t generation = 0;
+    uint32_t data = 0;
+    const CsdModifier* modifier = nullptr;
+};
+
+static std::atomic<uintptr_t> g_modifierCacheOwner{ 0 };
+// perf8: 2048 sets of two entries (the most recent first) instead of 512 direct-mapped ones, as UnleashedRecomp-NX
+// round 15 (SwitchLargeModifierCache): FindCsdModifierEntry was still 0.3 % of the game thread in the perf7 profile.
+static CsdModifierCacheEntry g_ownerModifierCache[4096];
+
+static uintptr_t CurrentThreadTlsRegion()
+{
+    uintptr_t region;
+    __asm__ ("mrs %x[data], tpidrro_el0" : [data] "=r" (region));
+    return region;
+}
+
+static const CsdModifier* FindCsdModifierCached(uint32_t data)
+{
+    const uintptr_t self = CurrentThreadTlsRegion();
+    uintptr_t owner = g_modifierCacheOwner.load(std::memory_order_relaxed);
+    if (owner == 0 && g_modifierCacheOwner.compare_exchange_strong(owner, self, std::memory_order_relaxed))
+        owner = self;
+
+    const uint64_t generation = g_pathsGeneration.load(std::memory_order_acquire);
+    if (owner == self)
+    {
+        CsdModifierCacheEntry* ways = &g_ownerModifierCache[((data * 0x9E3779B1u) >> 21) * 2];
+        if (ways[0].generation == generation && ways[0].data == data)
+            return ways[0].modifier;
+
+        if (ways[1].generation == generation && ways[1].data == data)
+        {
+            std::swap(ways[0], ways[1]);
+            return ways[0].modifier;
+        }
+
+        ways[1] = ways[0];
+        ways[0].modifier = FindCsdModifierEntry(data);
+        ways[0].data = data;
+        ways[0].generation = generation;
+        return ways[0].modifier;
+    }
+
+    // Constant-initialised (no per-thread constructor), 1.5 KB of every other thread's TLS.
+    thread_local CsdModifierCacheEntry threadCache[64];
+    auto& entry = threadCache[(data * 0x9E3779B1u) >> 26];
+    if (entry.generation == generation && entry.data == data)
+        return entry.modifier;
+
+    entry.modifier = FindCsdModifierEntry(data);
+    entry.data = data;
+    entry.generation = generation;
+    return entry.modifier;
+}
+#endif
+
+std::optional<CsdModifier> FindCsdModifier(uint32_t data)
+{
+#if defined(__SWITCH__)
+    const CsdModifier* modifier = g_switchModifierCache ? FindCsdModifierCached(data) : FindCsdModifierEntry(data);
+#else
+    const CsdModifier* modifier = FindCsdModifierEntry(data);
+#endif
+
+    if (modifier != nullptr)
+        return *modifier;
 
     return {};
 }

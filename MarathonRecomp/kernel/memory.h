@@ -16,6 +16,12 @@ struct Memory
     Memory();
 
 #if defined(__SWITCH__)
+    // [Switch] Reserved after the 4 GB window and never committed (SWITCH_WIDE_DFORM, ppc_context.h): a register +
+    // displacement access whose 32-bit sum would wrap past 4 GB lands here instead of in the window's first 64 KB,
+    // and the fault handler (os/switch/exception_switch.cpp) emulates it at the wrapped address. 64 KB covers every
+    // displacement the form is used with (0-4095, or any from r1) plus the access size.
+    static constexpr size_t SWITCH_WRAP_GUARD_SIZE = 0x10000;
+
     bool CommitRange(size_t offset, size_t size) noexcept;
     bool CommitHostRange(const void* host, size_t size) noexcept;
     bool IsRangeCommitted(size_t offset, size_t size) const noexcept;

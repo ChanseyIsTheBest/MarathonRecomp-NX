@@ -882,8 +882,16 @@ void Config::Save()
 
     for (auto def : g_configDefinitions)
     {
+#if defined(__SWITCH__)
+        // The [Switch] performance and diagnostics keys are hidden from the options menu. The ones set to something
+        // other than their default are written here, so that they survive the next save; the others are left out,
+        // so that a later build's defaults apply to them. They are declared last (config_def.h): one section.
+        if (def->IsHidden() && (def->GetSection() != "Switch" || def->IsDefaultValue()))
+            continue;
+#else
         if (def->IsHidden())
             continue;
+#endif
 
         auto isFirstSection = section.empty();
         auto isDefWithSection = section != def->GetSection();
